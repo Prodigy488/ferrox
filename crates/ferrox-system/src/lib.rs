@@ -456,8 +456,8 @@ pub fn demo_xbe() -> Vec<u8> {
 }
 
 /// Machine code for the demo's GPU part: describes a few objects to the GPU,
-/// sends it a command buffer that draws two filled rectangles and a
-/// colour-blended triangle over the gradient, and prints how many command bytes the GPU consumed.
+/// sends it a command buffer that draws two filled rectangles and two
+/// colour-blended triangles (one transformed by a vertex program, one read from a vertex array) over the gradient, and prints how many command bytes the GPU consumed.
 /// `ebx` holds the framebuffer address.
 fn gpu_demo(c: &mut Vec<u8>, call_dbgprint: Vec<u8>, push_fmt: Vec<u8>) {
     use ferrox_nv2a::gpu::{ramht_hash, KELVIN_CLASS};
@@ -466,6 +466,7 @@ fn gpu_demo(c: &mut Vec<u8>, call_dbgprint: Vec<u8>, push_fmt: Vec<u8>) {
     const KELVIN: u32 = 0xB0B0;
     const COLOR_DMA: u32 = 0xC0DE;
     const PUSHBUF: u32 = 0x03F0_0000;
+    const VERTICES: u32 = 0x03F1_0000;
     let st = |c: &mut Vec<u8>, addr: u32, val: u32| {
         c.extend([0xC7, 0x05]); // mov dword [addr], imm32
         c.extend(addr.to_le_bytes());
@@ -505,13 +506,35 @@ fn gpu_demo(c: &mut Vec<u8>, call_dbgprint: Vec<u8>, push_fmt: Vec<u8>) {
     for (x0, x1, y0, y1, colour) in [(100u32, 539u32, 80u32, 399u32, 0xFFE0_8020u32), (180, 459, 140, 339, 0xFF10_2060)] {
         put(&[hdr(0x1D98, 2), x0 | (x1 << 16), y0 | (y1 << 16), hdr(0x1D90, 1), colour, hdr(0x1D94, 1), 0xF0]);
     }
-    // a triangle with red, green and blue corners inside the inner rectangle
+    // a vertex program that transforms model-space vertices to pixels (scale 100 x 80, centred on 320, 240)
+    let program = ferrox_nv2a::vsh::asm::matrix_program();
     let mut put = |ws: &[u32]| words.extend(ws.iter().map(|&w| Some(w)));
+    put(&[hdr(0x1E94, 1), 2, hdr(0x1E9C, 1), 0, hdr(0x1EA0, 1), 0, hdr(0x1EA4, 1), 0, hdr(0xB00, program.len() as u32)]);
+    put(&program);
+    put(&[hdr(0xB80, 16)]);
+    for row in [[100.0f32, 0.0, 0.0, 320.0], [0.0, -80.0, 0.0, 240.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]] {
+        put(&row.map(f32::to_bits));
+    }
+    // a triangle with red, green and blue corners inside the inner rectangle, sent vertex by vertex
     put(&[hdr(0x17FC, 1), 5]);
-    for (x, y, argb) in [(320.0f32, 160.0f32, 0xFFFF_0000u32), (220.0, 320.0, 0xFF00_FF00), (420.0, 320.0, 0xFF00_00FF)] {
+    for (x, y, argb) in [(0.0f32, 1.0f32, 0xFFFF_0000u32), (-1.0, -1.0, 0xFF00_FF00), (1.0, -1.0, 0xFF00_00FF)] {
         put(&[hdr(0x194C, 1), argb, hdr(0x1A00, 4), x.to_bits(), y.to_bits(), 0, 1.0f32.to_bits()]);
     }
     put(&[hdr(0x17FC, 1), 0]);
+    // a second triangle, read from a vertex array in memory: x, y, z floats and a packed colour per vertex
+    put(&[
+        hdr(0x19C, 1), COLOR_DMA,
+        hdr(0x1720, 1), VERTICES, hdr(0x1760, 1), 2 | (3 << 4) | (16 << 8),
+        hdr(0x172C, 1), VERTICES + 12, hdr(0x176C, 1), (4 << 4) | (16 << 8),
+        hdr(0x17FC, 1), 5, hdr(0x1810, 1), 2 << 24, hdr(0x17FC, 1), 0,
+    ]);
+    for (i, (x, y, argb)) in [(-1.8f32, 0.5f32, 0xFFFF_FFFFu32), (-2.1, -0.5, 0xFFFF_FF00), (-1.5, -0.5, 0xFF00_FFFF)].into_iter().enumerate() {
+        let at = VERTICES + 16 * i as u32;
+        st(c, at, x.to_bits());
+        st(c, at + 4, y.to_bits());
+        st(c, at + 8, 0);
+        st(c, at + 12, argb);
+    }
     for (i, w) in words.iter().enumerate() {
         let at = PUSHBUF + 4 * i as u32;
         match w {
@@ -556,11 +579,11 @@ mod tests {
         let mut frames = Vec::new();
         let rep = run(&cfg, &Arc::new(AtomicBool::new(false)), |s| out.push_str(s), |f| frames.push(f)).unwrap();
         let game_out: String = out.lines().filter(|l| !l.starts_with("[ferrox]")).map(|l| format!("{l}\n")).collect();
-        assert_eq!(game_out, "gpu id: 02a000a3\ngpu took 208 bytes of commands\nhello, xbox! (test pattern drawn)\n");
+        assert_eq!(game_out, "gpu id: 02a000a3\ngpu took 472 bytes of commands\nhello, xbox! (test pattern drawn)\n");
         assert!(out.contains("display set: 640x480"), "{out}");
         assert!(out.contains("gpu id: 02a000a3"), "{out}");
         assert!(!out.contains("registers touched but not emulated"), "the demo only uses implemented registers: {out}");
-        assert!(out.contains("GPU work not emulated yet: vertex program not run"), "the gap is reported: {out}");
+        assert!(!out.contains("not emulated yet"), "the demo only uses implemented features: {out}");
         assert!(out.contains("CPU: reference"), "{out}");
         let last = frames.last().expect("the demo displays a picture");
         assert_eq!((last.width, last.height), (640, 480));
@@ -576,7 +599,10 @@ mod tests {
         let mid = px(320, 280);
         assert!(mid[0] > 0x10 && mid[1] > 0x20 && mid[2] > 0x20, "colours blend inside the triangle: {mid:?}");
         assert_eq!(px(200, 160), [0x10, 0x20, 0x60, 0xFF], "outside the triangle is still the inner rectangle");
-        assert!(out.contains("GPU ran 32 commands (2 surface clears, 1 triangles)"), "{out}");
+        let arr = px(140, 270);
+        assert!(arr[0] > 0x80 && arr[1] > 0x80 && arr != [0xE0, 0x80, 0x20, 0xFF], "triangle read from a vertex array: {arr:?}");
+        assert_eq!(px(120, 200), [0xE0, 0x80, 0x20, 0xFF], "outside the array triangle is still orange");
+        assert!(out.contains("GPU ran 84 commands (2 surface clears, 2 triangles)"), "{out}");
         assert_eq!(rep.outcome, Outcome::GuestStopped("HalReturnToFirmware(0)".into()));
         assert!(rep.backend.starts_with("reference"));
         std::fs::remove_dir_all(&dir).unwrap();

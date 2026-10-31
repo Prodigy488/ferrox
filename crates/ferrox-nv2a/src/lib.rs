@@ -12,6 +12,7 @@
 pub mod device;
 pub mod gpu;
 pub mod raster;
+pub mod vsh;
 
 use std::fmt;
 

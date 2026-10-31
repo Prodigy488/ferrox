@@ -9,6 +9,7 @@
 
 use crate::device::Shared;
 use crate::raster::{self, Surface, Vertex};
+use crate::vsh::{self, Program};
 use crate::{decode, Command};
 use ferrox_machine::RamView;
 use std::collections::BTreeMap;
@@ -62,6 +63,21 @@ const NV097_SET_BEGIN_END: u32 = 0x17FC;
 const NV097_SET_VERTEX_DATA2F_M: u32 = 0x1880;
 const NV097_SET_VERTEX_DATA4UB: u32 = 0x1940;
 const NV097_SET_VERTEX_DATA4F_M: u32 = 0x1A00;
+const NV097_SET_CONTEXT_DMA_VERTEX_A: u32 = 0x19C;
+const NV097_SET_CONTEXT_DMA_VERTEX_B: u32 = 0x1A0;
+const NV097_SET_VERTEX_DATA_ARRAY_OFFSET: u32 = 0x1720;
+const NV097_SET_VERTEX_DATA_ARRAY_FORMAT: u32 = 0x1760;
+const NV097_ARRAY_ELEMENT16: u32 = 0x1800;
+const NV097_ARRAY_ELEMENT32: u32 = 0x1808;
+const NV097_DRAW_ARRAYS: u32 = 0x1810;
+const NV097_SET_TRANSFORM_PROGRAM: u32 = 0xB00;
+const NV097_SET_TRANSFORM_CONSTANT: u32 = 0xB80;
+const NV097_SET_TRANSFORM_EXECUTION_MODE: u32 = 0x1E94;
+const NV097_SET_TRANSFORM_PROGRAM_CXT_WRITE_EN: u32 = 0x1E98;
+const NV097_SET_TRANSFORM_PROGRAM_LOAD: u32 = 0x1E9C;
+const NV097_SET_TRANSFORM_PROGRAM_START: u32 = 0x1EA0;
+const NV097_SET_TRANSFORM_CONSTANT_LOAD: u32 = 0x1EA4;
+const EXEC_MODE_PROGRAM: u32 = 2;
 const ATTR_DIFFUSE: usize = 3;
 const PRIM_TRIANGLES: u32 = 5;
 const PRIM_TRIANGLE_STRIP: u32 = 6;
@@ -110,6 +126,10 @@ pub struct Gpu {
     /// Primitive type between Begin and End, 0 outside.
     prim: u32,
     verts: Vec<Vertex>,
+    vsh: Program,
+    prog_load: usize,
+    const_load: usize,
+    vertex_base: [u32; 2],
 }
 
 impl Gpu {
@@ -127,6 +147,10 @@ impl Gpu {
             attrs: Self::initial_attrs(),
             prim: 0,
             verts: Vec::new(),
+            vsh: Program::default(),
+            prog_load: 0,
+            const_load: 0,
+            vertex_base: [0; 2],
         }
     }
 
@@ -353,6 +377,49 @@ impl Gpu {
             }
             NV097_CLEAR_SURFACE => self.clear_surface(v),
             NV097_SET_BEGIN_END => self.begin_end(v),
+            NV097_SET_TRANSFORM_PROGRAM..=0xB7C => {
+                let slot = ((m - NV097_SET_TRANSFORM_PROGRAM) / 4) as usize;
+                if self.prog_load < vsh::MAX_INSTRUCTIONS {
+                    self.vsh.slots[self.prog_load][slot % 4] = v;
+                }
+                if slot % 4 == 3 {
+                    self.prog_load += 1;
+                }
+            }
+            NV097_SET_TRANSFORM_CONSTANT..=0xBFC => {
+                let slot = ((m - NV097_SET_TRANSFORM_CONSTANT) / 4) as usize;
+                if self.const_load < vsh::CONSTANTS {
+                    self.vsh.constants[self.const_load][slot % 4] = f32::from_bits(v);
+                }
+                if slot % 4 == 3 {
+                    self.const_load += 1;
+                }
+            }
+            NV097_SET_TRANSFORM_PROGRAM_LOAD => self.prog_load = v as usize,
+            NV097_SET_TRANSFORM_CONSTANT_LOAD => self.const_load = v as usize,
+            NV097_SET_TRANSFORM_EXECUTION_MODE
+            | NV097_SET_TRANSFORM_PROGRAM_START
+            | NV097_SET_TRANSFORM_PROGRAM_CXT_WRITE_EN => {
+                self.kelvin.insert(m, v);
+            }
+            NV097_SET_CONTEXT_DMA_VERTEX_A | NV097_SET_CONTEXT_DMA_VERTEX_B => match self.dma_base_of(v) {
+                Some(b) => self.vertex_base[((m - NV097_SET_CONTEXT_DMA_VERTEX_A) / 4) as usize] = b,
+                None => self.shared.log(format!("vertex DMA handle {v:#x} is not in the hash table")),
+            },
+            NV097_SET_VERTEX_DATA_ARRAY_OFFSET..=0x175C | NV097_SET_VERTEX_DATA_ARRAY_FORMAT..=0x179C => {
+                self.kelvin.insert(m, v);
+            }
+            NV097_DRAW_ARRAYS => {
+                let (start, count) = (v & 0x00FF_FFFF, (v >> 24) + 1);
+                for i in start..start + count {
+                    self.fetch_and_emit(i);
+                }
+            }
+            NV097_ARRAY_ELEMENT16 => {
+                self.fetch_and_emit(v & 0xFFFF);
+                self.fetch_and_emit(v >> 16);
+            }
+            NV097_ARRAY_ELEMENT32 => self.fetch_and_emit(v),
             NV097_SET_VERTEX_DATA2F_M..=0x18FF => {
                 let slot = ((m - NV097_SET_VERTEX_DATA2F_M) / 4) as usize;
                 let (attr, comp) = (slot / 2, slot % 2);
@@ -452,19 +519,63 @@ impl Gpu {
             self.shared.gap(format!("drawing into a colour surface of format {:#x}", surface.format));
             return;
         }
-        self.shared.gap("vertex program not run: positions are used as screen coordinates".into());
+        if self.k(NV097_SET_TRANSFORM_EXECUTION_MODE) & 3 != EXEC_MODE_PROGRAM {
+            self.shared.gap("fixed-function transform not emulated: positions are used as screen coordinates".into());
+        }
         for t in tris {
             raster::fill_triangle(&surface, [verts[t[0]], verts[t[1]], verts[t[2]]]);
             self.shared.count_triangle();
         }
     }
 
+    /// Reads vertex `index` from the arrays the program set up, then emits it.
+    fn fetch_and_emit(&mut self, index: u32) {
+        let Some(ram) = self.ram else { return };
+        for a in 0..16u32 {
+            let fmt = self.k(NV097_SET_VERTEX_DATA_ARRAY_FORMAT + 4 * a);
+            let (ty, size, stride) = (fmt & 0xF, ((fmt >> 4) & 0xF) as usize, (fmt >> 8) as u64);
+            if size == 0 {
+                continue;
+            }
+            let off = self.k(NV097_SET_VERTEX_DATA_ARRAY_OFFSET + 4 * a);
+            let base = self.vertex_base[(off >> 31) as usize] as u64 + (off & 0x7FFF_FFFF) as u64;
+            let at = base + index as u64 * stride;
+            let mut val = [0.0, 0.0, 0.0, 1.0];
+            match ty {
+                2 => {
+                    for (k, slot) in val.iter_mut().enumerate().take(size.min(4)) {
+                        *slot = f32::from_bits(ram.read_u32(at + 4 * k as u64).unwrap_or(0));
+                    }
+                }
+                0 | 4 if size == 4 => {
+                    let Some(b) = ram.bytes(at, 4) else { continue };
+                    // UB_D3D is memory order B, G, R, A; UB_OGL is R, G, B, A
+                    let (r, g, bl, al) = if ty == 0 { (b[2], b[1], b[0], b[3]) } else { (b[0], b[1], b[2], b[3]) };
+                    val = [r as f32 / 255.0, g as f32 / 255.0, bl as f32 / 255.0, al as f32 / 255.0];
+                }
+                t => {
+                    self.shared.gap(format!("vertex array of type {t} with {size} components"));
+                    continue;
+                }
+            }
+            self.attrs[a as usize] = val;
+        }
+        self.emit_vertex();
+    }
+
     fn emit_vertex(&mut self) {
         if self.prim == 0 {
             return;
         }
-        let (p, c) = (self.attrs[0], self.attrs[ATTR_DIFFUSE]);
-        self.verts.push(Vertex { x: p[0], y: p[1], color: c });
+        if self.k(NV097_SET_TRANSFORM_EXECUTION_MODE) & 3 == EXEC_MODE_PROGRAM {
+            let out = self.vsh.run(self.k(NV097_SET_TRANSFORM_PROGRAM_START) as usize, &self.attrs);
+            let (p, c) = (out[vsh::O_POS], out[vsh::O_D0]);
+            // the program has already applied the viewport: oPos is in pixels
+            self.verts.push(Vertex { x: p[0], y: p[1], color: c });
+        } else {
+            let (p, c) = (self.attrs[0], self.attrs[ATTR_DIFFUSE]);
+            self.verts.push(Vertex { x: p[0], y: p[1], color: c });
+        }
     }
 
     fn clear_surface(&mut self, flags: u32) {
@@ -677,11 +788,11 @@ mod tests {
     fn unknown_methods_and_bad_handles_are_reported_not_fatal() {
         let (mut g, shared, mut mem) = setup();
         init(&mut g);
-        kick(&mut g, &mut mem, &[hdr(0x100, 1), 0, hdr(0, 1), 0x1234, hdr(0, 1), KELVIN, hdr(0x1808, 1), 7]);
+        kick(&mut g, &mut mem, &[hdr(0x100, 1), 0, hdr(0, 1), 0x1234, hdr(0, 1), KELVIN, hdr(0x1E20, 1), 7]);
         let log = shared.take_log();
         assert!(log.iter().any(|l| l.contains("no object bound")), "{log:?}");
         assert!(log.iter().any(|l| l.contains("0x1234")), "{log:?}");
-        assert!(shared.gaps().iter().any(|(k, _)| k.contains("0x1808")), "{:?}", shared.gaps());
+        assert!(shared.gaps().iter().any(|(k, _)| k.contains("0x1e20")), "{:?}", shared.gaps());
     }
 
     #[test]
@@ -738,7 +849,7 @@ mod tests {
         // one gap is recorded, and it says what is missing
         let gaps = shared.gaps();
         assert_eq!(gaps.len(), 1, "{gaps:?}");
-        assert!(gaps[0].0.contains("vertex program"), "{gaps:?}");
+        assert!(gaps[0].0.contains("fixed-function"), "{gaps:?}");
     }
 
     #[test]
@@ -770,5 +881,109 @@ mod tests {
         kick(&mut g, &mut mem, &w);
         assert_eq!(shared.triangles(), 0);
         assert!(shared.gaps().iter().any(|(k, _)| k.contains("primitive type 2")), "{:?}", shared.gaps());
+    }
+
+    /// Program: oPos = v0 * (matrix in c0..c3), oD0 = v3.
+    fn transform_program_words() -> Vec<u32> {
+        use crate::vsh::{asm::*, O_D0, O_POS};
+        let mut insts: Vec<Inst> = Vec::new();
+        for (i, mask) in [X, Y, Z, W].into_iter().enumerate() {
+            insts.push(Inst::mac(DP4, to_temp(0, mask), v(0), Some(c(i as u32)), None));
+        }
+        insts.push(Inst::mac(MOV, to_out(O_POS, ALL), r(0), None, None));
+        insts.push(Inst::mac(MOV, to_out(O_D0, ALL), v(3), None, None).last());
+        assemble(&insts).into_iter().flatten().collect()
+    }
+
+    fn matrix_words(sx: f32, sy: f32, tx: f32, ty: f32) -> Vec<u32> {
+        [[sx, 0.0, 0.0, tx], [0.0, sy, 0.0, ty], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0f32]]
+            .iter()
+            .flatten()
+            .map(|x| x.to_bits())
+            .collect()
+    }
+
+    fn program_setup(m: Vec<u32>) -> Vec<u32> {
+        let prog = transform_program_words();
+        let mut w = vec![hdr(0x1E94, 1), 2, hdr(0x1E9C, 1), 0, hdr(0x1EA0, 1), 0, hdr(0x1EA4, 1), 0];
+        w.push(hdr(0xB00, prog.len() as u32));
+        w.extend(prog);
+        w.push(hdr(0xB80, 16));
+        w.extend(m);
+        w
+    }
+
+    #[test]
+    fn the_vertex_program_transforms_vertices() {
+        let (mut g, shared, mut mem) = setup();
+        init(&mut g);
+        let mut w = setup_surface();
+        w.extend(program_setup(matrix_words(20.0, -10.0, 32.0, 20.0)));
+        w.extend([hdr(0x17FC, 1), 5]);
+        // model-space triangle (0,1) (-1,-1) (1,-1) lands at (32,10) (12,30) (52,30)
+        w.extend(vertex(0.0, 1.0, 0xFFFF_FFFF));
+        w.extend(vertex(-1.0, -1.0, 0xFFFF_FFFF));
+        w.extend(vertex(1.0, -1.0, 0xFFFF_FFFF));
+        w.extend([hdr(0x17FC, 1), 0]);
+        kick(&mut g, &mut mem, &w);
+        assert_eq!(shared.triangles(), 1);
+        assert_eq!(pixel(&mut mem, 32, 25), 0xFFFF_FFFF, "inside the transformed triangle");
+        assert_eq!(pixel(&mut mem, 5, 5), 0, "outside it");
+        assert_eq!(pixel(&mut mem, 3, 29), 0, "outside it");
+        assert!(shared.gaps().is_empty(), "{:?}", shared.gaps());
+        assert!(shared.take_log().is_empty());
+    }
+
+    #[test]
+    fn vertex_arrays_are_fetched_from_memory() {
+        let (mut g, shared, mut mem) = setup();
+        init(&mut g);
+        let view = mem.ram_view(0).unwrap();
+        const VB: u64 = 0x30_0000;
+        // three vertices of 16 bytes: x y z (floats) and a packed colour; pixel coordinates (no program)
+        for (i, (x, y, argb)) in [(4.0f32, 4.0f32, 0xFFFF_0000u32), (60.0, 4.0, 0xFF00_FF00), (4.0, 28.0, 0xFF00_00FF)].iter().enumerate() {
+            let at = VB + 16 * i as u64;
+            view.write_u32(at, x.to_bits());
+            view.write_u32(at + 4, y.to_bits());
+            view.write_u32(at + 8, 0);
+            view.write_u32(at + 12, *argb);
+        }
+        let mut w = setup_surface();
+        w.extend([
+            hdr(0x19C, 1), COLOR_DMA,
+            hdr(0x1720, 1), VB as u32,
+            hdr(0x1760, 1), 2 | (3 << 4) | (16 << 8),
+            hdr(0x172C, 1), VB as u32 + 12,
+            hdr(0x176C, 1), 0 | (4 << 4) | (16 << 8),
+            hdr(0x17FC, 1), 5,
+            hdr(0x1810, 1), 2 << 24,
+            hdr(0x17FC, 1), 0,
+        ]);
+        kick(&mut g, &mut mem, &w);
+        assert_eq!(shared.triangles(), 1);
+        assert!(pixel(&mut mem, 5, 5) >> 16 & 0xFF > 0xE0, "red corner: {:#x}", pixel(&mut mem, 5, 5));
+        assert!(shared.take_log().is_empty());
+    }
+
+    #[test]
+    fn indexed_elements_use_the_same_arrays() {
+        let (mut g, shared, mut mem) = setup();
+        init(&mut g);
+        let view = mem.ram_view(0).unwrap();
+        const VB: u64 = 0x30_0000;
+        for (i, (x, y)) in [(4.0f32, 4.0f32), (60.0, 4.0), (4.0, 28.0), (60.0, 28.0)].iter().enumerate() {
+            view.write_u32(VB + 8 * i as u64, x.to_bits());
+            view.write_u32(VB + 8 * i as u64 + 4, y.to_bits());
+        }
+        let mut w = setup_surface();
+        w.extend([
+            hdr(0x19C, 1), COLOR_DMA, hdr(0x1720, 1), VB as u32, hdr(0x1760, 1), 2 | (2 << 4) | (8 << 8),
+            hdr(0x17FC, 1), 5,
+            hdr(0x1800, 2) | 0x4000_0000, 1 << 16, 3 | (2 << 16), // non-incrementing: indices (0, 1) then (3, 2)
+            hdr(0x17FC, 1), 0,
+        ]);
+        kick(&mut g, &mut mem, &w);
+        // elements 0,1,3,2 as TRIANGLES: only the first three (0,1,3) form a triangle
+        assert_eq!(shared.triangles(), 1);
     }
 }
