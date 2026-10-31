@@ -47,6 +47,10 @@ pub struct Shared {
     unhandled: Mutex<BTreeMap<(bool, u32), u32>>,
     /// The latest register accesses (is_write, offset, value), for finding what a stuck game waits on.
     recent: Mutex<std::collections::VecDeque<(bool, u32, u32)>>,
+    /// PGRAPH_SURFACE: the display-flip counters (write index bits 20-22, read index 24-26,
+    /// modulus 28-30). The game's pushbuffer advances the write index; its vblank handler
+    /// advances the read index.
+    surface: AtomicU32,
     /// What the GPU is doing right now (0 = idle): the method being run, for finding a hang.
     activity: AtomicU64,
     /// How often each register was touched.
@@ -90,6 +94,38 @@ impl Shared {
             0 => None,
             v => Some(v),
         }
+    }
+
+    pub(crate) fn surface(&self) -> u32 {
+        self.surface.load(Ordering::Relaxed)
+    }
+
+    /// Replaces the bits of PGRAPH_SURFACE under `mask`.
+    pub(crate) fn set_surface(&self, mask: u32, value: u32) {
+        let mut old = self.surface.load(Ordering::Relaxed);
+        loop {
+            let new = old & !mask | value & mask;
+            match self.surface.compare_exchange(old, new, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return,
+                Err(o) => old = o,
+            }
+        }
+    }
+
+    /// The write index moves on by one, wrapping at the modulus.
+    pub(crate) fn flip_write_increment(&self) {
+        let s = self.surface();
+        let modulus = (s >> 28) & 7;
+        let w = if modulus == 0 { 0 } else { (((s >> 20) & 7) + 1) % modulus };
+        self.set_surface(SURFACE_WRITE, w << 20);
+    }
+
+    /// The read index moves on by one, wrapping at the modulus (the vblank handler's flip).
+    pub(crate) fn flip_read_increment(&self) {
+        let s = self.surface();
+        let modulus = (s >> 28) & 7;
+        let r = if modulus == 0 { 0 } else { (((s >> 24) & 7) + 1) % modulus };
+        self.set_surface(SURFACE_READ, r << 24);
     }
 
     pub(crate) fn set_activity(&self, v: u64) {
@@ -187,6 +223,11 @@ pub struct Nv2a {
     scratch: BTreeMap<u32, u32>,
 }
 
+const PGRAPH_SURFACE: u64 = 0x40_0710;
+const PGRAPH_INCREMENT: u64 = 0x40_071C;
+pub(crate) const SURFACE_WRITE: u32 = 0x0070_0000;
+pub(crate) const SURFACE_READ: u32 = 0x0700_0000;
+pub(crate) const SURFACE_MODULO: u32 = 0x7000_0000;
 // PBUS: a window onto the chip's PCI configuration
 const PBUS_PCI_ID: u64 = 0x1800;
 const PBUS_PCI_COMMAND: u64 = 0x1804;
@@ -292,6 +333,7 @@ impl Nv2a {
                 self.status_toggle = !self.status_toggle;
                 if self.status_toggle { 0x09 } else { 0x00 }
             }
+            PGRAPH_SURFACE => self.shared.surface() as u64,
             PFB_CSTATUS => 64 << 20, // the amount of video memory
             PFB_WBC | PVIDEO_STOP => 0, // "flush not pending", "overlay stopped"
             PRAMDAC_PLL_TEST_COUNTER => 0xF800_0000, // every PLL reports locked
@@ -320,6 +362,12 @@ impl Nv2a {
         }
         match offset {
             PMC_INTR_EN_0 => self.shared.pmc_intr_en.store(v, Ordering::Relaxed),
+            PGRAPH_SURFACE => self.shared.set_surface(u32::MAX, v),
+            PGRAPH_INCREMENT => {
+                if v & 2 != 0 {
+                    self.shared.flip_read_increment();
+                }
+            }
             PBUS_PCI_COMMAND | PTIMER_NUMERATOR | PTIMER_DENOMINATOR => {
                 self.scratch.insert(offset as u32, v);
             }

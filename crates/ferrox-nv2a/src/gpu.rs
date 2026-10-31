@@ -54,6 +54,11 @@ fn known_pfifo(off: u32) -> bool {
 const NV097_NO_OPERATION: u32 = 0x100;
 const NV097_SET_CONTEXT_DMA_NOTIFIES: u32 = 0x180;
 const NV097_WAIT_FOR_IDLE: u32 = 0x110;
+const NV097_SET_FLIP_READ: u32 = 0x120;
+const NV097_SET_FLIP_WRITE: u32 = 0x124;
+const NV097_SET_FLIP_MODULO: u32 = 0x128;
+const NV097_FLIP_INCREMENT_WRITE: u32 = 0x12C;
+const NV097_FLIP_STALL: u32 = 0x130;
 const NV097_SET_CONTEXT_DMA_SEMAPHORE: u32 = 0x1A4;
 const NV097_SET_SEMAPHORE_OFFSET: u32 = 0x1D6C;
 const NV097_BACK_END_WRITE_SEMAPHORE_RELEASE: u32 = 0x1D70;
@@ -257,6 +262,8 @@ impl Gpu {
             CACHE1_DMA_PUT => self.dma_put,
             CACHE1_DMA_GET => self.dma_get,
             PFIFO_RUNOUT_STATUS | CACHE1_STATUS => QUEUE_EMPTY,
+            // the pusher is never busy: it has taken everything the game handed it
+            CACHE1_DMA_PUSH => self.reg(off) & !QUEUE_EMPTY,
             CACHE1_DMA_CTL => self.reg(off) | 0x8000_0000, // no cached translation: always valid
             _ => {
                 if !known_pfifo(off) {
@@ -417,6 +424,14 @@ impl Gpu {
         match m {
             // everything runs the moment it is submitted, so there is never anything to wait for
             NV097_NO_OPERATION | NV097_WAIT_FOR_IDLE => {}
+            // the display flip queue: the game counts frames in and the vblank handler counts
+            // them out. A stall would hold the commands behind it until the picture was shown;
+            // commands run at once here, so it passes.
+            NV097_SET_FLIP_READ => self.shared.set_surface(crate::device::SURFACE_READ, v << 24),
+            NV097_SET_FLIP_WRITE => self.shared.set_surface(crate::device::SURFACE_WRITE, v << 20),
+            NV097_SET_FLIP_MODULO => self.shared.set_surface(crate::device::SURFACE_MODULO, v << 28),
+            NV097_FLIP_INCREMENT_WRITE => self.shared.flip_write_increment(),
+            NV097_FLIP_STALL => {}
             NV097_SET_CONTEXT_DMA_SEMAPHORE => match self.dma_base_of(v) {
                 Some(b) => self.semaphore_base = b,
                 None => self.shared.log(format!("semaphore DMA handle {v:#x} is not in the hash table")),
@@ -996,6 +1011,20 @@ mod tests {
         let (mut gpu, shared) = Nv2a::new();
         gpu.attach_ram(mem.ram_view(0).unwrap());
         (gpu, shared, mem)
+    }
+
+    #[test]
+    fn flip_counters_follow_the_pushbuffer_and_the_vblank_handler() {
+        let (mut g, shared, mut mem) = setup();
+        init(&mut g);
+        kick(&mut g, &mut mem, &[hdr(0, 1), KELVIN, hdr(0x128, 1), 3, hdr(0x12C, 1), 0, hdr(0x12C, 1), 0, hdr(0x130, 1), 0]);
+        let s = g.read(0x40_0710, 4);
+        assert_eq!(((s >> 28) & 7, (s >> 20) & 7, (s >> 24) & 7), (3, 2, 0));
+        g.write(0x40_071C, 4, 2);
+        g.write(0x40_071C, 4, 2);
+        g.write(0x40_071C, 4, 2);
+        assert_eq!((g.read(0x40_0710, 4) >> 24) & 7, 0, "the read index wraps at the modulus");
+        assert!(shared.gaps().is_empty(), "{:?}", shared.gaps());
     }
 
     #[test]
