@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ferrox-core",
+    "crates/ferrox-formats",
+    "crates/ferrox-machine",
+    "crates/ferrox-cpu",
+    "crates/ferrox-nv2a",
+    "crates/ferrox-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+repository = "https://github.com/Prodigy488/ferrox"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,9 @@
+[package]
+name = "ferrox-cpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ferrox-core = { path = "../ferrox-core" }

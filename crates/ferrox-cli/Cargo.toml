@@ -1,0 +1,14 @@
+[package]
+name = "ferrox-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ferrox-formats = { path = "../ferrox-formats" }
+ferrox-nv2a = { path = "../ferrox-nv2a" }
+
+[[bin]]
+name = "ferrox"
+path = "src/main.rs"

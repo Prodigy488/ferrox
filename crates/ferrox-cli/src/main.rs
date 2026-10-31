@@ -1,0 +1,144 @@
+//! `ferrox` command line: inspect discs and executables, dump pushbuffers.
+
+use ferrox_formats::{xbe::Xbe, xdvdfs::Xdvdfs, Error};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::process::ExitCode;
+
+const USAGE: &str = "ferrox - a work-in-progress original Xbox emulator
+
+usage:
+  ferrox info <file.xbe|file.iso>       describe an executable or disc image
+  ferrox ls <file.iso>                  list the files on a disc image
+  ferrox pushbuffer <file> [get] [put]  decode a raw NV2A pushbuffer dump
+                                        (get/put are hex byte offsets)";
+
+fn region_name(r: u32) -> String {
+    match r & 7 {
+        7 => "region free".into(),
+        0 => "unknown".into(),
+        bits => {
+            let mut v = Vec::new();
+            if bits & 1 != 0 { v.push("NTSC-U"); }
+            if bits & 2 != 0 { v.push("NTSC-J"); }
+            if bits & 4 != 0 { v.push("PAL"); }
+            v.join(" / ")
+        }
+    }
+}
+
+fn print_xbe(x: &Xbe, data: &[u8]) {
+    let c = &x.certificate;
+    println!("title:       {}", c.title_name);
+    println!("title id:    {:08X}", c.title_id);
+    println!("region:      {}", region_name(c.region));
+    println!("disc/version: {} / {}", c.disc_number, c.version);
+    println!("build:       {}", if x.retail { "retail" } else { "debug" });
+    println!("entry point: {:#010x}", x.entry_point);
+    println!("image:       base {:#x}, {} bytes", x.base_addr, x.size_of_image);
+    println!("sections:");
+    for s in &x.sections {
+        println!(
+            "  {:<12} va {:#010x} size {:#8x}  file {:#8x} size {:#8x}",
+            s.name, s.virtual_addr, s.virtual_size, s.raw_addr, s.raw_size
+        );
+    }
+    match x.kernel_imports(data) {
+        Ok(v) => println!("kernel imports: {} functions", v.len()),
+        Err(e) => println!("kernel imports: unreadable ({e})"),
+    }
+}
+
+fn info(path: &str) -> Result<(), Error> {
+    let mut f = File::open(path)?;
+    let mut magic = [0u8; 4];
+    let n = f.read(&mut magic)?;
+    f.seek(SeekFrom::Start(0))?;
+    if n == 4 && &magic == b"XBEH" {
+        let mut data = Vec::new();
+        f.read_to_end(&mut data)?;
+        print_xbe(&Xbe::parse(&data)?, &data);
+        return Ok(());
+    }
+    let mut fs = Xdvdfs::open(f)?;
+    println!("disc image, game partition at byte {:#x}", fs.partition_offset());
+    let all = fs.walk()?;
+    let files = all.iter().filter(|e| !e.is_dir).count();
+    println!("{} files, {} folders", files, all.len() - files);
+    match fs.find("default.xbe")? {
+        None => println!("no default.xbe at the top level"),
+        Some(e) => {
+            let data = fs.read_file(&e)?;
+            println!("\ndefault.xbe ({} bytes):", e.size);
+            print_xbe(&Xbe::parse(&data)?, &data);
+        }
+    }
+    Ok(())
+}
+
+fn ls(path: &str) -> Result<(), Error> {
+    let mut fs = Xdvdfs::open(File::open(path)?)?;
+    for e in fs.walk()? {
+        if e.is_dir {
+            println!("{:>12}  {}/", "", e.path);
+        } else {
+            println!("{:>12}  {}", e.size, e.path);
+        }
+    }
+    Ok(())
+}
+
+fn pushbuffer(args: &[String]) -> Result<(), String> {
+    let path = args.first().ok_or("pushbuffer needs a file")?;
+    let buf = std::fs::read(path).map_err(|e| e.to_string())?;
+    let hex = |i: usize, d: u32| -> Result<u32, String> {
+        match args.get(i) {
+            None => Ok(d),
+            Some(s) => u32::from_str_radix(s.trim_start_matches("0x"), 16)
+                .map_err(|_| format!("'{s}' is not a hex offset")),
+        }
+    };
+    let get = hex(1, 0)?;
+    let put = hex(2, buf.len() as u32)?;
+    let d = ferrox_nv2a::decode(&buf, get, put, 1_000_000).map_err(|e| e.to_string())?;
+    for c in &d.commands {
+        use ferrox_nv2a::Command::*;
+        match c {
+            Jump(a) => println!("JUMP {a:#x}"),
+            OldJump(a) => println!("OLD_JUMP {a:#x}"),
+            Call(a) => println!("CALL {a:#x}"),
+            Return => println!("RETURN"),
+            Methods { .. } => {}
+        }
+    }
+    for w in ferrox_nv2a::writes(&d.commands) {
+        let name = ferrox_nv2a::method_name(w.method).unwrap_or("");
+        println!("sc{} {:#06x} <= {:#010x}  {}", w.subchannel, w.method, w.value, name);
+    }
+    if d.truncated {
+        println!("(last method block is cut short)");
+    }
+    Ok(())
+}
+
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let result: Result<(), String> = match args.first().map(String::as_str) {
+        Some("info") => args.get(1).ok_or("info needs a file".to_string())
+            .and_then(|p| info(p).map_err(|e| e.to_string())),
+        Some("ls") => args.get(1).ok_or("ls needs a file".to_string())
+            .and_then(|p| ls(p).map_err(|e| e.to_string())),
+        Some("pushbuffer") => pushbuffer(&args[1..]),
+        _ => {
+            println!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("ferrox: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}

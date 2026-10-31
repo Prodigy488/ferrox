@@ -1,0 +1,12 @@
+[package]
+name = "ferrox-machine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ferrox-core = { path = "../ferrox-core" }
+
+[dev-dependencies]
+ferrox-cpu = { path = "../ferrox-cpu" }
