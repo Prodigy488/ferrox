@@ -151,17 +151,27 @@ pub struct WhpCpu {
 // cancel call from the watchdog, which WHP documents as safe to call concurrently).
 unsafe impl Send for WhpCpu {}
 
-fn seg(selector: u16, attrs: u16) -> WHV_REGISTER_VALUE {
+/// `WHV_REGISTER_VALUE` must be 16-byte aligned (the C header says so; the Rust
+/// binding only guarantees 8, which made the API fault on its first call).
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+struct Val(WHV_REGISTER_VALUE);
+
+const _: () = assert!(std::mem::size_of::<Val>() == 16 && std::mem::align_of::<Val>() == 16);
+
+fn seg(selector: u16, attrs: u16) -> Val {
     let mut s = WHV_X64_SEGMENT_REGISTER::default();
     s.Base = 0;
     s.Limit = 0xFFFF_FFFF;
     s.Selector = selector;
     s.Anonymous.Attributes = attrs;
-    WHV_REGISTER_VALUE { Segment: s }
+    Val(WHV_REGISTER_VALUE { Segment: s })
 }
 
-fn r64(v: u64) -> WHV_REGISTER_VALUE {
-    WHV_REGISTER_VALUE { Reg64: v }
+fn r64(v: u64) -> Val {
+    let mut x = WHV_REGISTER_VALUE::default();
+    x.Reg64 = v;
+    Val(x)
 }
 
 impl WhpCpu {
@@ -230,14 +240,14 @@ impl WhpCpu {
         let values = [
             seg(CODE_SEL, code), seg(DATA_SEL, data), seg(DATA_SEL, data), seg(DATA_SEL, data),
             seg(DATA_SEL, data), seg(DATA_SEL, data),
-            WHV_REGISTER_VALUE { Table: gdtr },
+            Val(WHV_REGISTER_VALUE { Table: gdtr }),
             r64(0x11), // PE | ET, no paging
             r64(entry as u64),
             r64(2),
         ];
         trace("setting initial registers");
         if let Err(e) = check(
-            (api.set_regs)(part, 0, names.as_ptr(), names.len() as u32, values.as_ptr()),
+            (api.set_regs)(part, 0, names.as_ptr(), names.len() as u32, values.as_ptr() as *const WHV_REGISTER_VALUE),
             "set initial registers",
         ) {
             return Err(this_fail(&api, part, e));
@@ -277,7 +287,7 @@ impl WhpCpu {
     fn set_one(&self, name: WHV_REGISTER_NAME, v: u64) {
         let value = r64(v);
         // SAFETY: one valid name/value pair.
-        unsafe { (self.api.set_regs)(self.part, 0, &name, 1, &value) };
+        unsafe { (self.api.set_regs)(self.part, 0, &name, 1, &value as *const Val as *const WHV_REGISTER_VALUE) };
     }
 }
 
@@ -311,11 +321,11 @@ impl CpuBackend for WhpCpu {
 
     fn regs(&self) -> Regs {
         let names: Vec<WHV_REGISTER_NAME> = GPRS.iter().copied().chain([WHvX64RegisterRip, WHvX64RegisterRflags]).collect();
-        let mut vals = vec![WHV_REGISTER_VALUE::default(); names.len()];
+        let mut vals = vec![Val(WHV_REGISTER_VALUE::default()); names.len()];
         // SAFETY: names and vals have the same length.
-        unsafe { (self.api.get_regs)(self.part, 0, names.as_ptr(), names.len() as u32, vals.as_mut_ptr()) };
+        unsafe { (self.api.get_regs)(self.part, 0, names.as_ptr(), names.len() as u32, vals.as_mut_ptr() as *mut WHV_REGISTER_VALUE) };
         // SAFETY: every register read here is a 64-bit value.
-        let g = |i: usize| unsafe { vals[i].Reg64 };
+        let g = |i: usize| unsafe { vals[i].0.Reg64 };
         Regs {
             gpr: std::array::from_fn(|i| g(i) as u32),
             eip: g(8) as u32,
@@ -326,18 +336,18 @@ impl CpuBackend for WhpCpu {
     fn set_regs(&mut self, regs: Regs) {
         let flags_now = {
             let name = WHvX64RegisterRflags;
-            let mut v = WHV_REGISTER_VALUE::default();
-            // SAFETY: one valid name and value slot.
-            unsafe { (self.api.get_regs)(self.part, 0, &name, 1, &mut v) };
+            let mut v = Val(WHV_REGISTER_VALUE::default());
+            // SAFETY: one valid name and a 16-byte-aligned value slot.
+            unsafe { (self.api.get_regs)(self.part, 0, &name, 1, &mut v as *mut Val as *mut WHV_REGISTER_VALUE) };
             // SAFETY: rflags is a 64-bit value.
-            unsafe { v.Reg64 }
+            unsafe { v.0.Reg64 }
         };
         let names: Vec<WHV_REGISTER_NAME> = GPRS.iter().copied().chain([WHvX64RegisterRip, WHvX64RegisterRflags]).collect();
-        let mut vals: Vec<WHV_REGISTER_VALUE> = regs.gpr.iter().map(|&v| r64(v as u64)).collect();
+        let mut vals: Vec<Val> = regs.gpr.iter().map(|&v| r64(v as u64)).collect();
         vals.push(r64(regs.eip as u64));
         vals.push(r64((flags_now & !0x40) | if regs.zf { 0x40 } else { 0 }));
         // SAFETY: names and vals have the same length.
-        unsafe { (self.api.set_regs)(self.part, 0, names.as_ptr(), names.len() as u32, vals.as_ptr()) };
+        unsafe { (self.api.set_regs)(self.part, 0, names.as_ptr(), names.len() as u32, vals.as_ptr() as *const WHV_REGISTER_VALUE) };
     }
 
     /// Runs until the guest halts, calls the host, or has run one time slice.
