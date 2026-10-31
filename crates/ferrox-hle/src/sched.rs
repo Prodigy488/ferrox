@@ -87,6 +87,18 @@ enum State {
 struct Injected {
     regs: Regs,
     irql: u8,
+    /// The caller gets the routine's result in `eax` (`KeSynchronizeExecution`).
+    keep_result: bool,
+}
+
+/// A device interrupt a driver asked for with `KeInitializeInterrupt`.
+#[derive(Clone, Copy, Debug)]
+pub struct Interrupt {
+    pub routine: u32,
+    pub context: u32,
+    pub vector: u32,
+    pub irql: u8,
+    pub connected: bool,
 }
 
 pub struct Thread {
@@ -133,6 +145,7 @@ pub struct Sched {
     /// Where an injected call (a DPC) returns to.
     pub inject_return: u32,
     pub tick_count_addr: Option<u32>,
+    pub interrupts: HashMap<u32, Interrupt>,
     /// `KeInterruptTime`: a `KSYSTEM_TIME` (low, high1, high2) in 100 ns units.
     pub interrupt_time_addr: Option<u32>,
     calls_since_switch: u32,
@@ -157,6 +170,7 @@ impl Default for Sched {
             thread_stub: 0,
             inject_return: 0,
             tick_count_addr: None,
+            interrupts: HashMap::new(),
             interrupt_time_addr: None,
             calls_since_switch: 0,
             ready: false,
@@ -535,9 +549,18 @@ impl Sched {
     /// Runs a call on the current thread's stack and then continues where the thread was:
     /// the thread's registers are saved, and `inject_return` restores them.
     pub fn inject_call(&mut self, bus: &mut dyn Bus, regs: &mut Regs, routine: u32, args: &[u32], irql: u8) {
+        self.inject(bus, regs, routine, args, irql, false);
+    }
+
+    /// Like `inject_call`, but the interrupted call returns what the routine returned.
+    pub fn inject_call_returning(&mut self, bus: &mut dyn Bus, regs: &mut Regs, routine: u32, args: &[u32], irql: u8) {
+        self.inject(bus, regs, routine, args, irql, true);
+    }
+
+    fn inject(&mut self, bus: &mut dyn Bus, regs: &mut Regs, routine: u32, args: &[u32], irql: u8, keep_result: bool) {
         let prev = self.irql(bus);
         if let Some(t) = self.threads.get_mut(self.current) {
-            t.injected.push(Injected { regs: *regs, irql: prev });
+            t.injected.push(Injected { regs: *regs, irql: prev, keep_result });
         }
         self.set_irql(bus, irql);
         let esp = regs.gpr[ESP].wrapping_sub(4 * (args.len() as u32 + 1));
@@ -555,8 +578,12 @@ impl Sched {
             return 0;
         };
         self.set_irql(bus, saved.irql);
+        let result = regs.gpr[0];
         *regs = saved.regs;
-        saved.regs.gpr[0]
+        if saved.keep_result {
+            regs.gpr[0] = result;
+        }
+        regs.gpr[0]
     }
 
     /// Starts the next queued DPC on the running thread if the interrupt level allows it.

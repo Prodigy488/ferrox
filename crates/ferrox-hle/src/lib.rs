@@ -16,6 +16,7 @@
 pub mod exports;
 pub mod kernel;
 pub mod ke;
+pub mod misc;
 pub mod sched;
 pub mod video;
 
@@ -365,6 +366,11 @@ impl KernelHle {
         start.extend(hyper(ORD_THREAD_END));
         mem.load(areas.stubs as u64, &start)?;
         mem.load(areas.stubs as u64 + 0x20, &hyper(ORD_INJECT_RETURN))?;
+        // the entry routine runs as the first thread: if it returns, the thread ends
+        let mut end = vec![0x89, 0xC1]; // mov ecx, eax
+        end.extend(hyper(ORD_THREAD_END));
+        mem.load(areas.stubs as u64 + 0x40, &end)?;
+        mem.write(areas.stack_top as u64, 4, areas.stubs as u64 + 0x40)?;
         self.sched.thread_stub = areas.stubs;
         self.sched.inject_return = areas.stubs + 0x20;
         self.sched.init(mem, areas.kpcr, areas.objects, areas.stack_top, areas.stack_size);

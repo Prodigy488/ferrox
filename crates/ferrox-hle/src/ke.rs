@@ -682,4 +682,21 @@ mod tests {
         assert_eq!(out(&mut mem, 0), 0, "a delay ends in success");
         assert!(out(&mut mem, 1) >= 10_000_000, "but the clock moved a second: {}", out(&mut mem, 1));
     }
+
+    #[test]
+    fn the_entry_routine_returning_ends_its_thread_and_others_carry_on() {
+        let mut a = Asm::default();
+        let routine_patch = a.code.len() + 1;
+        a.call("PsCreateSystemThreadEx", &[HANDLE, 0, 0, 0, 0, 0x77, 0, 0, 0, 0]);
+        a.call("NtClose", &[0x100]);
+        a.raw(&[0xC3]); // return from the entry point
+        let routine = a.here();
+        a.store_const(0, 0x55);
+        a.raw(&[0xC2, 8, 0]);
+        a.code[routine_patch..routine_patch + 4].copy_from_slice(&routine.to_le_bytes());
+        let (mut mem, hle, exit) = run(a, &[]);
+        assert_eq!(exit, Exit::Halt, "the last thread ending stops the run");
+        assert_eq!(out(&mut mem, 0), 0x55, "the second thread ran after the first returned");
+        assert_eq!(hle.sched.thread_count(), 0);
+    }
 }

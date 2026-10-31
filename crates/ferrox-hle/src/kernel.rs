@@ -227,6 +227,7 @@ pub fn install(hle: &mut KernelHle, heap: Range<u32>) -> Rc<RefCell<KernelState>
         });
     }
     crate::ke::install(hle, st.clone());
+    crate::misc::install(hle, st.clone());
     st
 }
 
