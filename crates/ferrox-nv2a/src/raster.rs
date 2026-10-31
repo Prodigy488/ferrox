@@ -4,6 +4,7 @@
 //! exists. Sampling is at pixel centres with a top-left fill rule, so triangles
 //! that share an edge never overdraw or leave gaps.
 
+use crate::texture::Texture;
 use ferrox_machine::RamView;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -12,8 +13,13 @@ pub struct Vertex {
     pub y: f32,
     /// Depth as the vertex program left it (window space, before scaling to the buffer).
     pub z: f32,
+    /// The clip-space w the program left in oPos (1.0 when positions are already in pixels).
+    /// Attributes are interpolated perspective-correctly with it.
+    pub w: f32,
     /// Red, green, blue, alpha in 0..=1.
     pub color: [f32; 4],
+    /// First texture coordinate set (s, t, r, q).
+    pub tex: [f32; 4],
 }
 
 /// A colour surface: where it is, how it is laid out, and the rectangle (the
@@ -123,7 +129,7 @@ fn owns_edge(a: (f32, f32), b: (f32, f32)) -> bool {
 
 /// Fills one triangle with colours interpolated from the corners. Returns the
 /// number of pixels written. Either winding is drawn (no culling yet).
-pub fn fill_triangle(s: &Surface, depth: Option<&Depth>, v: [Vertex; 3]) -> u64 {
+pub fn fill_triangle(s: &Surface, depth: Option<&Depth>, tex: Option<&Texture>, v: [Vertex; 3]) -> u64 {
     let Some(bpp) = bytes_per_pixel(s.format) else { return 0 };
     let area = edge((v[0].x, v[0].y), (v[1].x, v[1].y), (v[2].x, v[2].y));
     if area == 0.0 || !area.is_finite() {
@@ -148,9 +154,25 @@ pub fn fill_triangle(s: &Surface, depth: Option<&Depth>, v: [Vertex; 3]) -> u64 
             if !inside {
                 continue;
             }
+            // perspective-correct weights: edge function over each vertex's w
+            let inv = [1.0 / v[0].w.max(1e-12), 1.0 / v[1].w.max(1e-12), 1.0 / v[2].w.max(1e-12)];
+            let pw = [w[0] * inv[0], w[1] * inv[1], w[2] * inv[2]];
+            let psum = pw[0] + pw[1] + pw[2];
             let mut c = [0.0f32; 4];
             for (k, ck) in c.iter_mut().enumerate() {
-                *ck = (w[0] * v[0].color[k] + w[1] * v[1].color[k] + w[2] * v[2].color[k]) / area;
+                *ck = (pw[0] * v[0].color[k] + pw[1] * v[1].color[k] + pw[2] * v[2].color[k]) / psum;
+            }
+            if let Some(t) = tex {
+                let mut st = [0.0f32; 4];
+                for (k, sk) in st.iter_mut().enumerate() {
+                    *sk = (pw[0] * v[0].tex[k] + pw[1] * v[1].tex[k] + pw[2] * v[2].tex[k]) / psum;
+                }
+                // projective: divide by q (treat 0 as 1 for programs that leave it unset)
+                let q = if st[3] == 0.0 { 1.0 } else { st[3] };
+                let texel = t.sample(st[0] / q, st[1] / q);
+                for k in 0..4 {
+                    c[k] *= texel[k]; // modulate: see the register-combiner gap
+                }
             }
             if let Some(d) = depth {
                 let z = (w[0] * v[0].z + w[1] * v[1].z + w[2] * v[2].z) / area;
@@ -190,7 +212,7 @@ mod tests {
     }
 
     fn v(x: f32, y: f32, c: [f32; 4]) -> Vertex {
-        Vertex { x, y, z: 0.0, color: c }
+        Vertex { x, y, z: 0.0, w: 1.0, color: c, tex: [0.0; 4] }
     }
 
     const RED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
@@ -205,7 +227,7 @@ mod tests {
     fn fills_the_inside_and_nothing_outside() {
         let mut m = mem();
         let s = surface(&mut m, 8);
-        let n = fill_triangle(&s, None, [v(2.0, 2.0, RED), v(14.0, 2.0, RED), v(2.0, 14.0, RED)]);
+        let n = fill_triangle(&s, None, None, [v(2.0, 2.0, RED), v(14.0, 2.0, RED), v(2.0, 14.0, RED)]);
         assert_eq!(px(&s, 3, 3), 0xFFFF_0000);
         assert_eq!(px(&s, 13, 13), 0, "beyond the hypotenuse");
         assert_eq!(px(&s, 1, 3), 0, "left of the triangle");
@@ -216,8 +238,8 @@ mod tests {
     fn either_winding_draws_the_same_pixels() {
         let (mut m1, mut m2) = (mem(), mem());
         let (a, b) = (surface(&mut m1, 8), surface(&mut m2, 8));
-        let n1 = fill_triangle(&a, None, [v(1.0, 1.0, RED), v(12.0, 3.0, RED), v(5.0, 13.0, RED)]);
-        let n2 = fill_triangle(&b, None, [v(1.0, 1.0, RED), v(5.0, 13.0, RED), v(12.0, 3.0, RED)]);
+        let n1 = fill_triangle(&a, None, None, [v(1.0, 1.0, RED), v(12.0, 3.0, RED), v(5.0, 13.0, RED)]);
+        let n2 = fill_triangle(&b, None, None, [v(1.0, 1.0, RED), v(5.0, 13.0, RED), v(12.0, 3.0, RED)]);
         assert_eq!(n1, n2);
         assert!(n1 > 0);
         for y in 0..W {
@@ -232,8 +254,8 @@ mod tests {
         // two triangles making a square: every pixel of it is covered once
         let mut m = mem();
         let s = surface(&mut m, 8);
-        let a = fill_triangle(&s, None, [v(0.0, 0.0, RED), v(8.0, 0.0, RED), v(0.0, 8.0, RED)]);
-        let b = fill_triangle(&s, None, [v(8.0, 0.0, RED), v(8.0, 8.0, RED), v(0.0, 8.0, RED)]);
+        let a = fill_triangle(&s, None, None, [v(0.0, 0.0, RED), v(8.0, 0.0, RED), v(0.0, 8.0, RED)]);
+        let b = fill_triangle(&s, None, None, [v(8.0, 0.0, RED), v(8.0, 8.0, RED), v(0.0, 8.0, RED)]);
         assert_eq!(a + b, 64);
     }
 
@@ -242,7 +264,7 @@ mod tests {
         let mut m = mem();
         let s = surface(&mut m, 8);
         let (g, b) = ([0.0, 1.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]);
-        fill_triangle(&s, None, [v(0.0, 0.0, RED), v(16.0, 0.0, g), v(0.0, 16.0, b)]);
+        fill_triangle(&s, None, None, [v(0.0, 0.0, RED), v(16.0, 0.0, g), v(0.0, 16.0, b)]);
         let near_red = px(&s, 1, 1);
         assert!((near_red >> 16) & 0xFF > 0xC0, "{near_red:#x}");
         let mid = px(&s, 6, 6); // roughly equal weights
@@ -254,7 +276,7 @@ mod tests {
         let mut m = mem();
         let mut s = surface(&mut m, 8);
         s.clip = (4, 4, 4, 4);
-        fill_triangle(&s, None, [v(-50.0, -50.0, RED), v(80.0, -50.0, RED), v(-50.0, 80.0, RED)]);
+        fill_triangle(&s, None, None, [v(-50.0, -50.0, RED), v(80.0, -50.0, RED), v(-50.0, 80.0, RED)]);
         assert_eq!(px(&s, 4, 4), 0xFFFF_0000);
         assert_eq!(px(&s, 7, 7), 0xFFFF_0000);
         assert_eq!(px(&s, 8, 4), 0);
@@ -265,14 +287,14 @@ mod tests {
     fn degenerate_triangles_draw_nothing_and_16_bit_formats_pack() {
         let mut m = mem();
         let s = surface(&mut m, 8);
-        assert_eq!(fill_triangle(&s, None, [v(1.0, 1.0, RED), v(5.0, 5.0, RED), v(9.0, 9.0, RED)]), 0);
+        assert_eq!(fill_triangle(&s, None, None, [v(1.0, 1.0, RED), v(5.0, 5.0, RED), v(9.0, 9.0, RED)]), 0);
         assert_eq!(pack(3, RED), 0xF800);
         assert_eq!(pack(3, [0.0, 1.0, 0.0, 1.0]), 0x07E0);
         assert_eq!(pack(5, [0.2, 0.4, 0.6, 0.0]), 0xFF33_6699);
     }
 
     fn vz(x: f32, y: f32, z: f32, c: [f32; 4]) -> Vertex {
-        Vertex { x, y, z, color: c }
+        Vertex { x, y, z, w: 1.0, color: c, tex: [0.0; 4] }
     }
 
     fn depth_buffer(m: &mut PhysMem, format: u32, func: u32) -> Depth {
@@ -308,11 +330,11 @@ mod tests {
                 clear_depth(&d, if format == 1 { 0xFFFF } else { 0xFF_FFFF });
                 let (near, far) = (big(10.0, RED), big(60.0, BLUE));
                 if near_first {
-                    fill_triangle(&s, Some(&d), near);
-                    fill_triangle(&s, Some(&d), far);
+                    fill_triangle(&s, Some(&d), None, near);
+                    fill_triangle(&s, Some(&d), None, far);
                 } else {
-                    fill_triangle(&s, Some(&d), far);
-                    fill_triangle(&s, Some(&d), near);
+                    fill_triangle(&s, Some(&d), None, far);
+                    fill_triangle(&s, Some(&d), None, near);
                 }
                 assert_eq!(px(&s, 3, 3), 0xFFFF_0000, "format {format}, near first {near_first}");
             }
@@ -325,20 +347,20 @@ mod tests {
         let s = surface(&mut m, 8);
         let mut d = depth_buffer(&mut m, 2, 7);
         clear_depth(&d, 0xFF_FFFF);
-        fill_triangle(&s, Some(&d), big(10.0, RED)); // ALWAYS: drawn
+        fill_triangle(&s, Some(&d), None, big(10.0, RED)); // ALWAYS: drawn
         d.func = 0;
-        fill_triangle(&s, Some(&d), big(5.0, BLUE)); // NEVER: not drawn
+        fill_triangle(&s, Some(&d), None, big(5.0, BLUE)); // NEVER: not drawn
         assert_eq!(px(&s, 3, 3), 0xFFFF_0000);
         d.func = 4; // GREATER
-        fill_triangle(&s, Some(&d), big(5.0, BLUE)); // 5 is not greater than 10
+        fill_triangle(&s, Some(&d), None, big(5.0, BLUE)); // 5 is not greater than 10
         assert_eq!(px(&s, 3, 3), 0xFFFF_0000);
-        fill_triangle(&s, Some(&d), big(20.0, BLUE));
+        fill_triangle(&s, Some(&d), None, big(20.0, BLUE));
         assert_eq!(px(&s, 3, 3), 0xFF00_00FF);
         d.write = false;
         d.func = 7;
-        fill_triangle(&s, Some(&d), big(90.0, RED)); // drawn but the depth stays at 20
+        fill_triangle(&s, Some(&d), None, big(90.0, RED)); // drawn but the depth stays at 20
         d.func = 3; // LEQUAL against 20
-        fill_triangle(&s, Some(&d), big(30.0, BLUE));
+        fill_triangle(&s, Some(&d), None, big(30.0, BLUE));
         assert_eq!(px(&s, 3, 3), 0xFFFF_0000, "the depth buffer was not changed by the write-masked draw");
     }
 
@@ -349,7 +371,7 @@ mod tests {
         let d = depth_buffer(&mut m, 2, 1);
         clear_depth(&d, 0xFF_FFFF);
         d.ram.write(d.origin, &[0x5A]); // stencil of pixel (0,0)
-        fill_triangle(&s, Some(&d), big(10.0, RED));
+        fill_triangle(&s, Some(&d), None, big(10.0, RED));
         assert_eq!(d.ram.bytes(d.origin, 1).unwrap()[0], 0x5A);
         assert_ne!(d.ram.read_u32(d.origin).unwrap() >> 8, 0xFF_FFFF);
     }
@@ -360,8 +382,43 @@ mod tests {
         let s = surface(&mut m, 8);
         let d = depth_buffer(&mut m, 2, 7);
         clear_depth(&d, 0xFF_FFFF);
-        fill_triangle(&s, Some(&d), [vz(0.0, 0.0, 0.0, RED), vz(16.0, 0.0, 100.0, RED), vz(0.0, 16.0, 0.0, RED)]);
+        fill_triangle(&s, Some(&d), None, [vz(0.0, 0.0, 0.0, RED), vz(16.0, 0.0, 100.0, RED), vz(0.0, 16.0, 0.0, RED)]);
         let at = |x: u64| d.ram.read_u32(d.origin + x * 4).unwrap() >> 8;
         assert!(at(1) < at(8) && at(8) < at(14), "{} {} {}", at(1), at(8), at(14));
+    }
+
+    #[test]
+    fn perspective_correct_colour_favours_the_nearer_vertex() {
+        // the far vertex (w = 4) should have less influence at the middle of the edge
+        let mut m = mem();
+        let s = surface(&mut m, 8);
+        let near = Vertex { x: 0.0, y: 0.0, z: 0.0, w: 1.0, color: [1.0, 0.0, 0.0, 1.0], tex: [0.0; 4] };
+        let far = Vertex { x: 16.0, y: 0.0, z: 0.0, w: 4.0, color: [0.0, 0.0, 1.0, 1.0], tex: [0.0; 4] };
+        let third = Vertex { x: 0.0, y: 16.0, z: 0.0, w: 1.0, color: [1.0, 0.0, 0.0, 1.0], tex: [0.0; 4] };
+        fill_triangle(&s, None, None, [near, far, third]);
+        let p = px(&s, 7, 1);
+        assert!((p >> 16) & 0xFF > p & 0xFF, "red should dominate near the middle: {p:#x}");
+    }
+
+    #[test]
+    fn a_texture_modulates_the_colour() {
+        use crate::texture::{Address, Texture, FMT_LU_A8R8G8B8};
+        let mut m = mem();
+        let s = surface(&mut m, 8);
+        let ram = m.ram_view(0).unwrap();
+        // 2x1 texture: left texel white, right texel red, at 0x2000
+        ram.write_u32(0x2000, 0xFFFF_FFFF);
+        ram.write_u32(0x2004, 0xFFFF_0000);
+        let t = Texture {
+            ram, addr: 0x2000, format: FMT_LU_A8R8G8B8, width: 2, height: 1, pitch: 8,
+            wrap_u: Address::Clamp, wrap_v: Address::Clamp, bilinear: false, border: [0.0; 4],
+        };
+        let mk = |x: f32, y: f32, s: f32, t: f32| Vertex { x, y, z: 0.0, w: 1.0, color: [0.0, 0.5, 1.0, 1.0], tex: [s, t, 0.0, 1.0] };
+        // coordinates in texels: 0 at the left edge to 2 at the right (linear textures)
+        fill_triangle(&s, None, Some(&t), [mk(0.0, 0.0, 0.0, 0.0), mk(16.0, 0.0, 2.0, 0.0), mk(0.0, 16.0, 0.0, 0.0)]);
+        let left = px(&s, 1, 1);
+        assert_eq!(left & 0xFF, 0xFF, "white texel keeps the blue of the diffuse colour: {left:#x}");
+        let right = px(&s, 10, 1);
+        assert_eq!(right & 0xFF, 0, "red texel has no blue: {right:#x}");
     }
 }

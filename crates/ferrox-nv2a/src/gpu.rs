@@ -9,6 +9,7 @@
 
 use crate::device::Shared;
 use crate::raster::{self, Depth, Surface, Vertex};
+use crate::texture::{self, Address, Texture};
 use crate::vsh::{self, Program};
 use crate::{decode, Command};
 use ferrox_machine::RamView;
@@ -83,7 +84,12 @@ const NV097_SET_DEPTH_FUNC: u32 = 0x354;
 const NV097_SET_DEPTH_MASK: u32 = 0x35C;
 const NV097_SET_CLIP_MAX: u32 = 0x398;
 const NV097_SET_ZSTENCIL_CLEAR_VALUE: u32 = 0x1D8C;
+const NV097_SET_CONTEXT_DMA_A: u32 = 0x184;
+const NV097_SET_CONTEXT_DMA_B: u32 = 0x188;
+const NV097_SET_TEXTURE_BASE: u32 = 0x1B00; // four stages of 0x40 bytes
+const NV097_SET_SHADER_STAGE_PROGRAM: u32 = 0x1E70;
 const ATTR_DIFFUSE: usize = 3;
+const ATTR_TEXCOORD0: usize = 9;
 const PRIM_TRIANGLES: u32 = 5;
 const PRIM_TRIANGLE_STRIP: u32 = 6;
 const PRIM_TRIANGLE_FAN: u32 = 7;
@@ -136,6 +142,7 @@ pub struct Gpu {
     prog_load: usize,
     const_load: usize,
     vertex_base: [u32; 2],
+    texture_base: [u32; 2],
 }
 
 impl Gpu {
@@ -158,6 +165,7 @@ impl Gpu {
             prog_load: 0,
             const_load: 0,
             vertex_base: [0; 2],
+            texture_base: [0; 2],
         }
     }
 
@@ -393,6 +401,16 @@ impl Gpu {
             }
             NV097_CLEAR_SURFACE => self.clear_surface(v),
             NV097_SET_BEGIN_END => self.begin_end(v),
+            NV097_SET_CONTEXT_DMA_A | NV097_SET_CONTEXT_DMA_B => match self.dma_base_of(v) {
+                Some(b) => self.texture_base[((m - NV097_SET_CONTEXT_DMA_A) / 4) as usize] = b,
+                None => self.shared.log(format!("texture DMA handle {v:#x} is not in the hash table")),
+            },
+            NV097_SET_TEXTURE_BASE..=0x1BFF => {
+                self.kelvin.insert(m, v);
+            }
+            NV097_SET_SHADER_STAGE_PROGRAM => {
+                self.kelvin.insert(m, v);
+            }
             NV097_SET_TRANSFORM_PROGRAM..=0xB7C => {
                 let slot = ((m - NV097_SET_TRANSFORM_PROGRAM) / 4) as usize;
                 if self.prog_load < vsh::MAX_INSTRUCTIONS {
@@ -517,6 +535,77 @@ impl Gpu {
         })
     }
 
+    /// Texture stage 0 as set up, if it is enabled and the draw should sample it.
+    fn texture0(&self) -> Option<Texture> {
+        let mode = self.k(NV097_SET_SHADER_STAGE_PROGRAM) & 0x1F;
+        let control0 = self.k(NV097_SET_TEXTURE_BASE + 0x0C);
+        if mode == 0 || control0 & (1 << 30) == 0 {
+            return None;
+        }
+        if mode != 1 {
+            self.shared.gap(format!("pixel shader stage mode {mode:#x}"));
+            return None;
+        }
+        for stage in 1..4u32 {
+            if self.k(NV097_SET_SHADER_STAGE_PROGRAM) >> (5 * stage) & 0x1F != 0 {
+                self.shared.gap(format!("texture stage {stage}"));
+                break;
+            }
+        }
+        let base = |r: u32| self.k(NV097_SET_TEXTURE_BASE + r);
+        let format = base(0x04);
+        let colour = (format >> 8) & 0xFF;
+        let Some((layout, _)) = texture::describe(colour) else {
+            self.shared.gap(format!("texture format {colour:#x}"));
+            return None;
+        };
+        if (format >> 2) & 1 != 0 {
+            self.shared.gap("cube map textures".into());
+            return None;
+        }
+        if (format >> 4) & 0xF != 2 {
+            self.shared.gap(format!("{}-dimensional textures", (format >> 4) & 0xF));
+            return None;
+        }
+        let (width, height) = if layout == texture::Layout::Swizzled || layout == texture::Layout::Blocks {
+            (1u32 << ((format >> 20) & 0xF), 1u32 << ((format >> 24) & 0xF))
+        } else {
+            (base(0x1C) >> 16, base(0x1C) & 0xFFFF)
+        };
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let dma = match format & 3 {
+            1 => 0,
+            2 => 1,
+            _ => {
+                self.shared.gap("textures read from a context DMA other than A or B".into());
+                return None;
+            }
+        };
+        let filter = base(0x14);
+        let (min, mag) = ((filter >> 16) & 0xFF, (filter >> 24) & 0xF);
+        if (format >> 16) & 0xF > 1 && min >= 3 {
+            self.shared.gap("mipmap level selection (level 0 is used)".into());
+        }
+        let addr = base(0x08);
+        Some(Texture {
+            ram: self.ram?,
+            addr: self.texture_base[dma] as u64 + base(0x00) as u64,
+            format: colour,
+            width,
+            height,
+            pitch: base(0x10) >> 16,
+            wrap_u: Address::from_field(addr & 7),
+            wrap_v: Address::from_field((addr >> 8) & 7),
+            bilinear: mag == 2 || mag == 4,
+            border: {
+                let c = base(0x24);
+                [(c >> 16 & 0xFF) as f32 / 255.0, (c >> 8 & 0xFF) as f32 / 255.0, (c & 0xFF) as f32 / 255.0, (c >> 24) as f32 / 255.0]
+            },
+        })
+    }
+
     fn begin_end(&mut self, op: u32) {
         if op != 0 {
             self.prim = op;
@@ -565,8 +654,12 @@ impl Gpu {
             self.shared.gap("fixed-function transform not emulated: positions are used as screen coordinates".into());
         }
         let depth = self.depth(true);
+        let texture = self.texture0();
+        if texture.is_some() {
+            self.shared.gap("register combiners: the texture is multiplied with the diffuse colour".into());
+        }
         for t in tris {
-            raster::fill_triangle(&surface, depth.as_ref(), [verts[t[0]], verts[t[1]], verts[t[2]]]);
+            raster::fill_triangle(&surface, depth.as_ref(), texture.as_ref(), [verts[t[0]], verts[t[1]], verts[t[2]]]);
             self.shared.count_triangle();
         }
     }
@@ -614,10 +707,11 @@ impl Gpu {
             let out = self.vsh.run(self.k(NV097_SET_TRANSFORM_PROGRAM_START) as usize, &self.attrs);
             let (p, c) = (out[vsh::O_POS], out[vsh::O_D0]);
             // the program has already applied the viewport: oPos is in pixels
-            self.verts.push(Vertex { x: p[0], y: p[1], z: p[2], color: c });
+            let w = if p[3] > 0.0 { p[3] } else { 1.0 };
+            self.verts.push(Vertex { x: p[0], y: p[1], z: p[2], w, color: c, tex: out[vsh::O_T0] });
         } else {
             let (p, c) = (self.attrs[0], self.attrs[ATTR_DIFFUSE]);
-            self.verts.push(Vertex { x: p[0], y: p[1], z: p[2], color: c });
+            self.verts.push(Vertex { x: p[0], y: p[1], z: p[2], w: 1.0, color: c, tex: self.attrs[ATTR_TEXCOORD0] });
         }
     }
 
@@ -1165,5 +1259,95 @@ mod tests {
         w.extend([hdr(0x208, 1), 0x208, hdr(0x1D90, 1), 0xFFFF_FFFF, hdr(0x1D94, 1), 0xF0]);
         kick(&mut g, &mut mem, &w);
         assert!(shared.gaps().iter().any(|(k, _)| k.contains("swizzled")), "{:?}", shared.gaps());
+    }
+
+    const TX: u32 = 0x28_0000;
+
+    /// A 4x4 swizzled A8R8G8B8 texture whose texel (x, y) is (r = 60x+10, g = 60y+10, b = 0x80).
+    fn put_texture(mem: &mut PhysMem) {
+        let v = mem.ram_view(0).unwrap();
+        for y in 0..4u32 {
+            for x in 0..4u32 {
+                let idx = crate::texture::swizzle_index(x, y, 4, 4);
+                v.write_u32((TX + 4 * idx) as u64, 0xFF00_0080 | ((60 * x + 10) << 16) | ((60 * y + 10) << 8));
+            }
+        }
+    }
+
+    fn texture_state(format_colour: u32) -> Vec<u32> {
+        vec![
+            hdr(0x184, 1), COLOR_DMA, hdr(0x1B00, 1), TX,
+            hdr(0x1B04, 1), 1 | (2 << 4) | (format_colour << 8) | (1 << 16) | (2 << 20) | (2 << 24),
+            hdr(0x1B08, 1), 0x0001_0101, hdr(0x1B0C, 1), 1 << 30, hdr(0x1B14, 1), (1 << 16) | (1 << 24),
+            hdr(0x1E70, 1), 1,
+        ]
+    }
+
+    fn tvertex(x: f32, y: f32, s: f32, t: f32) -> Vec<u32> {
+        vec![hdr(0x194C, 1), 0xFFFF_FFFF, hdr(0x18C8, 2), f(s), f(t), hdr(0x1A00, 4), f(x), f(y), f(0.0), f(1.0)]
+    }
+
+    fn textured_quad() -> Vec<u32> {
+        let mut w = vec![hdr(0x17FC, 1), 8];
+        w.extend(tvertex(8.0, 4.0, 0.0, 0.0));
+        w.extend(tvertex(40.0, 4.0, 1.0, 0.0));
+        w.extend(tvertex(40.0, 20.0, 1.0, 1.0));
+        w.extend(tvertex(8.0, 20.0, 0.0, 1.0));
+        w.extend([hdr(0x17FC, 1), 0]);
+        w
+    }
+
+    #[test]
+    fn a_swizzled_texture_is_sampled_onto_a_quad() {
+        let (mut g, shared, mut mem) = setup();
+        init(&mut g);
+        put_texture(&mut mem);
+        let mut w = setup_surface();
+        w.extend(texture_state(0x06));
+        w.extend(textured_quad());
+        kick(&mut g, &mut mem, &w);
+        assert_eq!(shared.triangles(), 2);
+        // 32x16 pixels over 4x4 texels: texel (x, y) covers pixels 8+8x.., 4+4y..
+        for (px_, py_, tx, ty) in [(10, 5, 0u32, 0u32), (20, 14, 1, 2), (38, 18, 3, 3), (30, 6, 2, 0)] {
+            let got = pixel(&mut mem, px_, py_);
+            assert_eq!(got, 0xFF00_0080 | ((60 * tx + 10) << 16) | ((60 * ty + 10) << 8), "pixel ({px_},{py_}) should show texel ({tx},{ty})");
+        }
+        assert_eq!(pixel(&mut mem, 6, 10), 0, "outside the quad");
+        let gaps = shared.gaps();
+        assert!(gaps.iter().any(|(k, _)| k.contains("register combiners")), "{gaps:?}");
+    }
+
+    #[test]
+    fn bilinear_filtering_blends_texels() {
+        let (mut g, _, mut mem) = setup();
+        init(&mut g);
+        put_texture(&mut mem);
+        let mut w = setup_surface();
+        w.extend(texture_state(0x06));
+        w.extend([hdr(0x1B14, 1), (1 << 16) | (2 << 24)]); // linear magnification
+        w.extend(textured_quad());
+        kick(&mut g, &mut mem, &w);
+        // exactly on the border between texels 0 and 1 in x (pixel boundary at x = 16): the red channels average
+        let a = pixel(&mut mem, 15, 5) >> 16 & 0xFF;
+        let b = pixel(&mut mem, 16, 5) >> 16 & 0xFF;
+        assert!(a > 10 && b < 70 && a < 70 && b > 10, "{a} {b}");
+        assert!(a != 10 || b != 70, "filtered, not nearest: {a} {b}");
+    }
+
+    #[test]
+    fn unsupported_texture_formats_and_modes_are_reported() {
+        let (mut g, shared, mut mem) = setup();
+        init(&mut g);
+        let mut w = setup_surface();
+        w.extend(texture_state(0x0B)); // palettised
+        w.extend(textured_quad());
+        w.extend(texture_state(0x06));
+        w.extend([hdr(0x1E70, 1), 3]); // cube map shader mode
+        w.extend(textured_quad());
+        kick(&mut g, &mut mem, &w);
+        let gaps = shared.gaps();
+        assert!(gaps.iter().any(|(k, _)| k.contains("texture format 0xb")), "{gaps:?}");
+        assert!(gaps.iter().any(|(k, _)| k.contains("pixel shader stage mode 0x3")), "{gaps:?}");
+        assert_eq!(pixel(&mut mem, 20, 10), 0xFFFF_FFFF, "undrawable textures fall back to the plain colour");
     }
 }

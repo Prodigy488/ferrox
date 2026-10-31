@@ -457,7 +457,8 @@ pub fn demo_xbe() -> Vec<u8> {
 
 /// Machine code for the demo's GPU part: describes a few objects to the GPU,
 /// sends it a command buffer that draws two filled rectangles and two
-/// colour-blended triangles (one transformed by a vertex program, one read from a vertex array) over the gradient, and prints how many command bytes the GPU consumed.
+/// colour-blended triangles (one transformed by a vertex program, one read from a vertex array), a
+/// depth-tested quad and a textured quad over the gradient, and prints how many command bytes the GPU consumed.
 /// `ebx` holds the framebuffer address.
 fn gpu_demo(c: &mut Vec<u8>, call_dbgprint: Vec<u8>, push_fmt: Vec<u8>) {
     use ferrox_nv2a::gpu::{ramht_hash, KELVIN_CLASS};
@@ -468,6 +469,7 @@ fn gpu_demo(c: &mut Vec<u8>, call_dbgprint: Vec<u8>, push_fmt: Vec<u8>) {
     const PUSHBUF: u32 = 0x03F0_0000;
     const VERTICES: u32 = 0x03F1_0000;
     const DEPTH_BUFFER: u32 = 0x0280_0000;
+    const TEXTURE: u32 = 0x03F2_0000;
     let st = |c: &mut Vec<u8>, addr: u32, val: u32| {
         c.extend([0xC7, 0x05]); // mov dword [addr], imm32
         c.extend(addr.to_le_bytes());
@@ -549,6 +551,24 @@ fn gpu_demo(c: &mut Vec<u8>, call_dbgprint: Vec<u8>, push_fmt: Vec<u8>) {
         st(c, at + 8, 0);
         st(c, at + 12, argb);
     }
+    // a 4x4 texture (swizzled, A8R8G8B8: red grows with x, green with y) on a quad at the right
+    let mut put = |ws: &[u32]| words.extend(ws.iter().map(|&w| Some(w)));
+    put(&[
+        hdr(0x184, 1), COLOR_DMA, hdr(0x1B00, 1), TEXTURE,
+        hdr(0x1B04, 1), 1 | (2 << 4) | (0x06 << 8) | (1 << 16) | (2 << 20) | (2 << 24),
+        hdr(0x1B08, 1), 0x0001_0101, hdr(0x1B0C, 1), 1 << 30, hdr(0x1B14, 1), (1 << 16) | (1 << 24), hdr(0x1E70, 1), 1,
+    ]);
+    put(&[hdr(0x17FC, 1), 8]);
+    for (x, y, s_, t_) in [(1.5f32, 1.125f32, 0.0f32, 0.0f32), (2.1, 1.125, 1.0, 0.0), (2.1, -0.125, 1.0, 1.0), (1.5, -0.125, 0.0, 1.0)] {
+        put(&[hdr(0x194C, 1), 0xFFFF_FFFF, hdr(0x18C8, 2), s_.to_bits(), t_.to_bits(), hdr(0x1A00, 4), x.to_bits(), y.to_bits(), 0, 1.0f32.to_bits()]);
+    }
+    put(&[hdr(0x17FC, 1), 0]);
+    for y in 0..4u32 {
+        for x in 0..4u32 {
+            let index = ferrox_nv2a::texture::swizzle_index(x, y, 4, 4);
+            st(c, TEXTURE + 4 * index, 0xFF00_0080 | ((x * 85) << 16) | ((y * 85) << 8));
+        }
+    }
     for (i, w) in words.iter().enumerate() {
         let at = PUSHBUF + 4 * i as u32;
         match w {
@@ -593,11 +613,13 @@ mod tests {
         let mut frames = Vec::new();
         let rep = run(&cfg, &Arc::new(AtomicBool::new(false)), |s| out.push_str(s), |f| frames.push(f)).unwrap();
         let game_out: String = out.lines().filter(|l| !l.starts_with("[ferrox]")).map(|l| format!("{l}\n")).collect();
-        assert_eq!(game_out, "gpu id: 02a000a3\ngpu took 692 bytes of commands\nhello, xbox! (test pattern drawn)\n");
+        assert_eq!(game_out, "gpu id: 02a000a3\ngpu took 940 bytes of commands\nhello, xbox! (test pattern drawn)\n");
         assert!(out.contains("display set: 640x480"), "{out}");
         assert!(out.contains("gpu id: 02a000a3"), "{out}");
         assert!(!out.contains("registers touched but not emulated"), "the demo only uses implemented registers: {out}");
-        assert!(!out.contains("not emulated yet"), "the demo only uses implemented features: {out}");
+        assert!(out.contains("GPU work not emulated yet: register combiners"), "the one known gap is reported: {out}");
+        assert!(!out.contains("registers touched but not emulated"), "{out}");
+        assert!(!out.contains("; "), "no other gaps: {out}");
         assert!(out.contains("CPU: reference"), "{out}");
         let last = frames.last().expect("the demo displays a picture");
         assert_eq!((last.width, last.height), (640, 480));
@@ -613,13 +635,15 @@ mod tests {
         let mid = px(320, 280);
         assert!(mid[0] > 0x10 && mid[1] > 0x20 && mid[2] > 0x20, "colours blend inside the triangle: {mid:?}");
         assert_eq!(px(200, 160), [0x10, 0x20, 0x60, 0xFF], "outside the triangle is still the inner rectangle");
+        assert_eq!(px(492, 212), [85, 170, 0x80, 0xFF], "texel (1, 2) of the texture on the right-hand quad");
+        assert_eq!(px(522, 238), [255, 255, 0x80, 0xFF], "texel (3, 3)");
         assert_eq!(px(420, 232), [0xFF, 0xFF, 0xFF, 0xFF], "the farther white quad shows where nothing is in front of it");
         let hidden = px(350, 232);
         assert!(hidden != [0xFF, 0xFF, 0xFF, 0xFF] && hidden[0] > 0x10, "the quad is hidden behind the triangle: {hidden:?}");
         let arr = px(140, 270);
         assert!(arr[0] > 0x80 && arr[1] > 0x80 && arr != [0xE0, 0x80, 0x20, 0xFF], "triangle read from a vertex array: {arr:?}");
         assert_eq!(px(120, 200), [0xE0, 0x80, 0x20, 0xFF], "outside the array triangle is still orange");
-        assert!(out.contains("GPU ran 118 commands (3 surface clears, 4 triangles)"), "{out}");
+        assert!(out.contains("GPU ran 159 commands (3 surface clears, 6 triangles)"), "{out}");
         assert_eq!(rep.outcome, Outcome::GuestStopped("HalReturnToFirmware(0)".into()));
         assert!(rep.backend.starts_with("reference"));
         std::fs::remove_dir_all(&dir).unwrap();

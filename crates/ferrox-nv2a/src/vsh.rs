@@ -406,7 +406,7 @@ pub mod asm {
         }
     }
 
-    /// A typical transform: `oPos = v0 * M` (M's rows in c0..c3) and `oD0 = v3`, as the words
+    /// A typical transform: `oPos = v0 * M` (M's rows in c0..c3), `oT0 = v9` and `oD0 = v3`, as the words
     /// a program would upload. Handy for demos and tests.
     pub fn matrix_program() -> Vec<u32> {
         let mut insts: Vec<Inst> = [X, Y, Z, W]
@@ -415,6 +415,7 @@ pub mod asm {
             .map(|(i, mask)| Inst::mac(DP4, to_temp(0, mask), v(0), Some(c(i as u32)), None))
             .collect();
         insts.push(Inst::mac(MOV, to_out(O_POS, ALL), r(0), None, None));
+        insts.push(Inst::mac(MOV, to_out(O_T0, ALL), v(9), None, None));
         insts.push(Inst::mac(MOV, to_out(O_D0, ALL), v(3), None, None).last());
         assemble(&insts).into_iter().flatten().collect()
     }
