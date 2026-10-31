@@ -199,6 +199,14 @@ impl CpuBackend for KvmCpu {
         }
     }
 
+    fn set_fs_base(&mut self, base: u32) {
+        if let Ok(mut s) = self.vcpu.get_sregs() {
+            s.fs.base = base as u64;
+            s.fs.limit = 0xFFFF_FFFF;
+            let _ = self.vcpu.set_sregs(&s);
+        }
+    }
+
     fn set_regs(&mut self, regs: Regs) {
         let mut r = self.vcpu.get_regs().unwrap_or_default();
         let g = regs.gpr;

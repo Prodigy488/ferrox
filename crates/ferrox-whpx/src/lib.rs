@@ -474,6 +474,16 @@ impl CpuBackend for WhpCpu {
         }
     }
 
+    fn set_fs_base(&mut self, base: u32) {
+        let data = 0x3 | 1 << 4 | 1 << 7 | 1 << 14 | 1 << 15;
+        let mut v = seg(DATA_SEL, data);
+        // SAFETY: `seg` built a segment-register value; only its base changes.
+        unsafe { v.0.Segment.Base = base as u64 };
+        let name = WHvX64RegisterFs;
+        // SAFETY: one valid name and a 16-byte-aligned value.
+        unsafe { (self.api.set_regs)(self.part, 0, &name, 1, &v as *const Val as *const WHV_REGISTER_VALUE) };
+    }
+
     fn set_regs(&mut self, regs: Regs) {
         let flags_now = {
             let name = WHvX64RegisterRflags;

@@ -14,8 +14,7 @@ use std::rc::Rc;
 pub const STATUS_SUCCESS: u32 = 0;
 pub const STATUS_NO_MEMORY: u32 = 0xC000_0017;
 const PAGE: u32 = 4096;
-/// Reported by `KeQueryPerformanceFrequency`: the console's 733 MHz clock.
-pub const PERF_FREQUENCY: u64 = 733_333_333;
+
 
 /// State the handlers share, readable by the front end.
 #[derive(Debug, Default)]
@@ -24,9 +23,6 @@ pub struct KernelState {
     heap_end: u32,
     /// Everything the guest printed through `DbgPrint`.
     pub debug: String,
-    /// Deterministic clocks: they advance a fixed step per query.
-    pub perf_counter: u64,
-    pub system_time: u64,
     /// Why the guest asked to stop, if it did.
     pub stop_reason: Option<String>,
     /// The picture the game last selected for display.
@@ -36,7 +32,7 @@ pub struct KernelState {
 }
 
 impl KernelState {
-    fn alloc(&mut self, size: u32, align: u32) -> Option<u32> {
+    pub(crate) fn alloc(&mut self, size: u32, align: u32) -> Option<u32> {
         let align = align.max(16).next_power_of_two();
         let start = self.heap_next.checked_add(align - 1)? & !(align - 1);
         let end = start.checked_add(size.max(1))?;
@@ -120,8 +116,6 @@ pub fn install(hle: &mut KernelHle, heap: Range<u32>) -> Rc<RefCell<KernelState>
     let st = Rc::new(RefCell::new(KernelState {
         heap_next: heap.start,
         heap_end: heap.end,
-        perf_counter: 1_000_000,
-        system_time: 0x01D0_0000_0000_0000,
         ..Default::default()
     }));
 
@@ -161,6 +155,7 @@ pub fn install(hle: &mut KernelHle, heap: Range<u32>) -> Rc<RefCell<KernelState>
         s.borrow_mut().alloc(pages(size), align).unwrap_or(0)
     });
     hle.handle("MmFreeContiguousMemory", |_| 0);
+    hle.handle("MmPersistContiguousMemory", |_| STATUS_SUCCESS);
 
     // --- virtual memory (identity-mapped: an allocation is just RAM) ---
     let s = st.clone();
@@ -180,37 +175,6 @@ pub fn install(hle: &mut KernelHle, heap: Range<u32>) -> Rc<RefCell<KernelState>
         }
     });
     hle.handle("NtFreeVirtualMemory", |_| STATUS_SUCCESS);
-    hle.handle("NtClose", |_| STATUS_SUCCESS);
-
-    // --- time ---
-    hle.handle("KeQueryPerformanceFrequency", |c| {
-        c.regs.gpr[ferrox_cpu::EDX] = (PERF_FREQUENCY >> 32) as u32;
-        PERF_FREQUENCY as u32
-    });
-    let s = st.clone();
-    hle.handle("KeQueryPerformanceCounter", move |c| {
-        let mut st = s.borrow_mut();
-        st.perf_counter += 10_000;
-        c.regs.gpr[ferrox_cpu::EDX] = (st.perf_counter >> 32) as u32;
-        st.perf_counter as u32
-    });
-    let s = st.clone();
-    hle.handle("KeQuerySystemTime", move |c| {
-        let out = c.arg(0).unwrap_or(0);
-        let mut st = s.borrow_mut();
-        st.system_time += 100_000; // 10 ms in 100 ns units
-        let t = st.system_time;
-        let _ = c.write_u32(out, t as u32);
-        let _ = c.write_u32(out + 4, (t >> 32) as u32);
-        0
-    });
-    hle.handle("KeStallExecutionProcessor", |_| 0);
-
-    // --- a single-threaded guest needs no real locking ---
-    hle.handle("KeGetCurrentIrql", |_| 0);
-    for name in ["RtlInitializeCriticalSection", "RtlEnterCriticalSection", "RtlLeaveCriticalSection"] {
-        hle.handle(name, |_| STATUS_SUCCESS);
-    }
 
     // --- strings ---
     hle.handle("RtlInitAnsiString", |c| {
@@ -262,6 +226,7 @@ pub fn install(hle: &mut KernelHle, heap: Range<u32>) -> Rc<RefCell<KernelState>
             0
         });
     }
+    crate::ke::install(hle, st.clone());
     st
 }
 
@@ -301,7 +266,8 @@ mod tests {
         let mut hle = KernelHle::with_table();
         install(&mut hle, 0x100_0000..0x200_0000);
         assert!(hle.is_implemented("DbgPrint"));
-        assert!(!hle.is_implemented("PsCreateSystemThreadEx"));
+        assert!(hle.is_implemented("PsCreateSystemThreadEx"));
+        assert!(!hle.is_implemented("IoCreateFile"));
     }
 
     #[test]
@@ -391,7 +357,7 @@ mod tests {
     fn unimplemented_calls_name_the_missing_export() {
         let mut hle = KernelHle::with_table();
         install(&mut hle, 0x100_0000..0x200_0000);
-        let ords = [ord("PsCreateSystemThreadEx")];
+        let ords = [ord("IoCreateFile")];
         let mut code = call_slot(0);
         code.push(0xF4);
         let mut file = build(true, &ords);
@@ -405,7 +371,7 @@ mod tests {
         r.gpr[ESP] = loaded.stack_top;
         cpu.set_regs(r);
         let err = hle.run(&mut cpu, &mut mem, 1000).unwrap_err();
-        assert!(err.to_string().contains("PsCreateSystemThreadEx"), "{err}");
+        assert!(err.to_string().contains("IoCreateFile"), "{err}");
     }
 
     #[test]

@@ -15,6 +15,8 @@
 
 pub mod exports;
 pub mod kernel;
+pub mod ke;
+pub mod sched;
 pub mod video;
 
 use exports::Conv;
@@ -22,7 +24,16 @@ use ferrox_core::{Bus, BusError};
 use ferrox_cpu::{CpuBackend, CpuError, Exit, Regs, ESP, HLE_PORT};
 use ferrox_formats::xbe::Xbe;
 use ferrox_machine::PhysMem;
-use std::collections::HashMap;
+use sched::Sched;
+use std::collections::{HashMap, VecDeque};
+
+/// Pseudo-exports used by the loader's own code stubs.
+pub const ORD_THREAD_END: u32 = 0xFFFF_FF01;
+pub const ORD_INJECT_RETURN: u32 = 0xFFFF_FF02;
+/// Bytes from the start of a call stub to the `ret` that follows its hypercall.
+const STUB_TO_RET: u32 = 7;
+/// How many recent kernel calls the diagnostics keep.
+const CALL_LOG: usize = 40;
 
 /// A host implementation of one kernel export.
 pub type Handler = Box<dyn FnMut(&mut Call) -> u32>;
@@ -31,6 +42,7 @@ pub type Handler = Box<dyn FnMut(&mut Call) -> u32>;
 pub struct Call<'a> {
     pub regs: &'a mut Regs,
     pub bus: &'a mut dyn Bus,
+    pub sched: &'a mut Sched,
     /// Set to end the run (the guest asked to reboot, shut down or crashed).
     pub stop: bool,
 }
@@ -55,6 +67,12 @@ impl Call<'_> {
             out.push(b);
         }
         Ok(out)
+    }
+
+    /// Makes the guest run this same call again when it next runs. For calls that must wait
+    /// for something and then look again (the stub is `mov eax, n; out; ret`).
+    pub fn retry(&mut self) {
+        self.regs.eip = self.regs.eip.wrapping_sub(STUB_TO_RET);
     }
 
     /// The `i`th 32-bit stack argument (stdcall: arg 0 is just above the
@@ -86,6 +104,19 @@ pub struct Layout {
 /// Bytes reserved for each exported data object such as `KeTickCount`.
 pub const DATA_SLOT: u32 = 64;
 
+/// Where the scheduler keeps its things in guest RAM.
+#[derive(Clone, Debug)]
+pub struct SchedAreas {
+    /// The processor control block (a page).
+    pub kpcr: u32,
+    /// Room for the two code stubs.
+    pub stubs: u32,
+    /// Memory for kernel objects (threads and the like).
+    pub objects: std::ops::Range<u32>,
+    pub stack_top: u32,
+    pub stack_size: u32,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum HleError {
     /// The game imports an export nobody has registered.
@@ -96,6 +127,8 @@ pub enum HleError {
     Cpu(String),
     /// The game called an export with no handler.
     UnimplementedCall { ordinal: u32, name: &'static str },
+    /// Every thread is waiting for something that can never happen.
+    Deadlock(String),
 }
 
 impl std::fmt::Display for HleError {
@@ -108,6 +141,7 @@ impl std::fmt::Display for HleError {
             HleError::UnimplementedCall { ordinal, name } => {
                 write!(f, "game called kernel export #{ordinal} ({name}), which is not implemented yet")
             }
+            HleError::Deadlock(threads) => write!(f, "deadlock: every thread is waiting ({threads})"),
         }
     }
 }
@@ -120,8 +154,22 @@ impl From<BusError> for HleError {
     }
 }
 
+/// One entry of the recent-calls log.
+#[derive(Clone, Copy, Debug)]
+struct CallRec {
+    ordinal: u32,
+    thread: u32,
+    args: [u32; 4],
+    ecx: u32,
+    edx: u32,
+    ret: u32,
+}
+
 #[derive(Default)]
 pub struct KernelHle {
+    /// Threads, waits and kernel objects.
+    pub sched: Sched,
+    log: VecDeque<CallRec>,
     exports: HashMap<u32, Export>,
     /// When set, a call to an export with no handler is recorded and answered with
     /// STATUS_SUCCESS (0) instead of stopping the run. For compatibility probing.
@@ -235,7 +283,7 @@ impl KernelHle {
     /// Copies the image into RAM (virtual addresses used as physical), and
     /// points every kernel import at a freshly written stub in `[stub_base, ..)`.
     pub fn load(
-        &self,
+        &mut self,
         mem: &mut PhysMem,
         xbe: &Xbe,
         file: &[u8],
@@ -285,7 +333,88 @@ impl KernelHle {
             stubs.push((ord, target));
             mem.write(xbe.kernel_thunk_addr as u64 + 4 * i as u64, 4, target as u64)?;
         }
+        // values the kernel publishes through its data exports
+        for &(ord, at) in &stubs {
+            let Some(name) = self.exports.get(&ord).filter(|e| e.data).map(|e| e.name) else { continue };
+            match name {
+                "KeTickCount" => self.sched.tick_count_addr = Some(at),
+                "KeInterruptTime" => self.sched.interrupt_time_addr = Some(at),
+                "KeTimeIncrement" => mem.write(at as u64, 4, 10_000)?,
+                // major, minor, build, qfe of a late retail kernel
+                "XboxKrnlVersion" => {
+                    mem.write(at as u64, 4, 1 | 5838 << 16)?;
+                    mem.write(at as u64 + 4, 4, 1 << 16)?;
+                }
+                _ => {}
+            }
+        }
         Ok(Loaded { entry: xbe.entry_point, stack_top: layout.stack_top, stubs })
+    }
+
+    /// Sets up threading: the control block, the main thread, and the two small code stubs
+    /// the scheduler needs (a thread's start-up and the return from an injected call).
+    pub fn start_scheduler(&mut self, mem: &mut PhysMem, areas: SchedAreas) -> Result<(), HleError> {
+        let hyper = |ord: u32| {
+            let mut code = vec![0xB8];
+            code.extend_from_slice(&ord.to_le_bytes());
+            code.extend_from_slice(&[0xE7, HLE_PORT as u8]);
+            code
+        };
+        // pop eax (the routine); call eax (stack: return, context1, context2); mov ecx, eax; end
+        let mut start = vec![0x58, 0xFF, 0xD0, 0x89, 0xC1];
+        start.extend(hyper(ORD_THREAD_END));
+        mem.load(areas.stubs as u64, &start)?;
+        mem.load(areas.stubs as u64 + 0x20, &hyper(ORD_INJECT_RETURN))?;
+        self.sched.thread_stub = areas.stubs;
+        self.sched.inject_return = areas.stubs + 0x20;
+        self.sched.init(mem, areas.kpcr, areas.objects, areas.stack_top, areas.stack_size);
+        Ok(())
+    }
+
+    /// The most recent kernel calls, oldest first, for diagnostics.
+    pub fn recent_calls(&self) -> Vec<String> {
+        self.log
+            .iter()
+            .map(|r| {
+                let name = match r.ordinal {
+                    ORD_THREAD_END => "(thread ended)",
+                    ORD_INJECT_RETURN => "(callback returned)",
+                    o => self.exports.get(&o).map_or("?", |e| e.name),
+                };
+                format!(
+                    "thread {}: {name}({:#x}, {:#x}, {:#x}, {:#x}) ecx={:#x} edx={:#x} -> {:#x}",
+                    r.thread, r.args[0], r.args[1], r.args[2], r.args[3], r.ecx, r.edx, r.ret
+                )
+            })
+            .collect()
+    }
+
+    fn record(&mut self, ordinal: u32, regs: &Regs, bus: &mut dyn Bus) {
+        let mut args = [0u32; 4];
+        for (i, a) in args.iter_mut().enumerate() {
+            *a = bus.read(regs.gpr[ESP] as u64 + 4 + 4 * i as u64, 4).unwrap_or(0) as u32;
+        }
+        if self.log.len() >= CALL_LOG {
+            self.log.pop_front();
+        }
+        self.log.push_back(CallRec { ordinal, thread: self.sched.current_id(), args, ecx: regs.gpr[1], edx: regs.gpr[2], ret: 0 });
+    }
+
+    /// After a call: switch threads if the call blocked or ended the running one, and start a
+    /// queued deferred procedure call if the interrupt level allows. Returns whether any
+    /// thread is left.
+    fn after_call(&mut self, regs: &mut Regs, bus: &mut dyn Bus) -> Result<(), HleError> {
+        if !self.sched.is_ready() {
+            return Ok(());
+        }
+        self.sched.tick(bus);
+        self.sched.note_call();
+        if self.sched.switch {
+            self.sched.reschedule(bus, regs)?;
+            self.sched.set_irql(bus, 0);
+        }
+        self.sched.run_pending_dpc(bus, regs);
+        Ok(())
     }
 
     /// Runs the guest, serving kernel calls, until it halts or `budget`
@@ -302,6 +431,21 @@ impl KernelHle {
             match cpu.run(bus, n).map_err(|e: CpuError| HleError::Cpu(e.to_string()))? {
                 Exit::Hypercall(ordinal) => {
                     *self.counts.entry(ordinal).or_default() += 1;
+                    let mut regs = cpu.regs();
+                    if ordinal == ORD_THREAD_END || ordinal == ORD_INJECT_RETURN {
+                        self.record(ordinal, &regs, bus);
+                        if ordinal == ORD_THREAD_END {
+                            if !self.sched.exit_current(bus, regs.gpr[1]) {
+                                return Ok(Exit::Halt);
+                            }
+                        } else {
+                            self.sched.return_from_injection(bus, &mut regs);
+                        }
+                        self.after_call(&mut regs, bus)?;
+                        cpu.set_regs(regs);
+                        budget = budget.saturating_sub(1);
+                        continue;
+                    }
                     let lenient = self.lenient;
                     if !self.exports.get(&ordinal).is_some_and(|e| e.handler.is_some()) {
                         if !lenient {
@@ -309,26 +453,37 @@ impl KernelHle {
                             return Err(HleError::UnimplementedCall { ordinal, name });
                         }
                         *self.missing.entry(ordinal).or_default() += 1;
-                        let mut regs = cpu.regs();
+                        self.record(ordinal, &regs, bus);
                         regs.gpr[0] = 0;
+                        self.after_call(&mut regs, bus)?;
                         cpu.set_regs(regs);
-                        budget -= 1;
+                        budget = budget.saturating_sub(1);
                         continue;
                     }
+                    self.record(ordinal, &regs, bus);
                     let ex = self.exports.get_mut(&ordinal).expect("checked above");
                     let handler = ex.handler.as_mut().expect("checked above");
-                    let mut regs = cpu.regs();
-                    let mut call = Call { regs: &mut regs, bus, stop: false };
+                    let mut call = Call { regs: &mut regs, bus, sched: &mut self.sched, stop: false };
                     let result = handler(&mut call);
                     let stop = call.stop;
                     regs.gpr[0] = result;
-                    cpu.set_regs(regs);
+                    if let Some(r) = self.log.back_mut() {
+                        r.ret = result;
+                    }
                     if stop {
+                        cpu.set_regs(regs);
                         return Ok(Exit::Halt);
                     }
-                    budget -= 1;
+                    self.after_call(&mut regs, bus)?;
+                    cpu.set_regs(regs);
+                    budget = budget.saturating_sub(1);
                 }
-                Exit::Budget => budget -= n,
+                Exit::Budget => {
+                    budget -= n;
+                    if self.sched.is_ready() {
+                        self.sched.tick(bus);
+                    }
+                }
                 Exit::Halt => return Ok(Exit::Halt),
             }
         }

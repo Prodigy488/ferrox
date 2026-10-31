@@ -10,7 +10,7 @@ use ferrox_formats::xbe::Xbe;
 use ferrox_formats::xdvdfs::Xdvdfs;
 use ferrox_hle::kernel::{self, KernelState};
 use ferrox_hle::video::Framebuffer;
-use ferrox_hle::{KernelHle, Layout};
+use ferrox_hle::{KernelHle, Layout, SchedAreas};
 use ferrox_machine::PhysMem;
 use std::fs::File;
 use std::io::BufReader;
@@ -21,6 +21,15 @@ use std::sync::Arc;
 pub const RAM_BYTES: usize = 64 * 1024 * 1024;
 const GDT_ADDR: u32 = 0x500;
 const STACK_TOP: u32 = 0x00E0_0000 - 16;
+/// Where the scheduler's control block, code stubs and kernel objects live (between the
+/// main stack and the import stubs).
+const SCHED: SchedAreas = SchedAreas {
+    kpcr: 0x00E1_0000,
+    stubs: 0x00E1_1000,
+    objects: 0x00E2_0000..0x00EF_0000,
+    stack_top: STACK_TOP,
+    stack_size: 0x4_0000,
+};
 const LAYOUT: Layout = Layout { stub_base: 0x00F0_0000, data_base: 0x00F1_0000, stack_top: STACK_TOP };
 const HEAP: std::ops::Range<u32> = 0x0200_0000..0x03F0_0000;
 
@@ -370,6 +379,8 @@ pub fn run(
     let state: std::rc::Rc<std::cell::RefCell<KernelState>> = kernel::install(&mut hle, HEAP);
     hle.set_lenient(cfg.probe.is_some());
     let loaded = hle.load(&mut mem, &xbe, &file, LAYOUT).map_err(|e| e.to_string())?;
+    hle.start_scheduler(&mut mem, SCHED).map_err(|e| e.to_string())?;
+    hle.sched.use_real_clock();
 
     trace("image loaded, creating the CPU backend");
     let mut cpu = make_backend(cfg.backend, &mut mem, loaded.entry)?;
@@ -378,6 +389,7 @@ pub fn run(
     r.gpr[ESP] = loaded.stack_top;
     r.eip = loaded.entry;
     cpu.set_regs(r);
+    cpu.set_fs_base(SCHED.kpcr);
     let backend = cpu.name();
     say(&format!("[ferrox] {title} - CPU: {backend}\n"));
 
@@ -537,6 +549,14 @@ fn probe_report(
         stack.push(format!("{:#x}", mem.read(r.gpr[ESP] as u64 + 4 * i, 4).unwrap_or(0)));
     }
     say(&format!("[probe] top of stack: {}\n", stack.join(" ")));
+    say(&format!("[probe] threads: {}\n", hle.sched.describe_threads()));
+    let calls = hle.recent_calls();
+    if !calls.is_empty() {
+        say("[probe] last kernel calls (oldest first):\n");
+        for line in calls {
+            say(&format!("[probe]   {line}\n"));
+        }
+    }
     say("[probe] ---- end of report ----\n");
 }
 

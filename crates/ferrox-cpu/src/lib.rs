@@ -72,6 +72,9 @@ pub trait CpuBackend {
     fn set_regs(&mut self, regs: Regs);
     /// Runs until `hlt` or until `max_instructions` have executed.
     fn run(&mut self, bus: &mut dyn Bus, max_instructions: u64) -> Result<Exit, CpuError>;
+    /// Points the `fs` segment at `base` (the kernel's per-processor control block, which the
+    /// game reads through `fs:[...]`). The test interpreter has no segments and ignores it.
+    fn set_fs_base(&mut self, _base: u32) {}
 }
 
 /// The test interpreter: nop, mov r32 imm32, mov eax/[abs32], inc/dec r32,
@@ -235,8 +238,15 @@ impl CpuBackend for RefCpu {
                     self.push(bus, v)?;
                 }
                 0xFF => {
-                    // only `call [abs32]` (ModRM 0x15)
+                    // `call [abs32]` (ModRM 0x15) and `call r32` (0xD0..0xD7)
                     let modrm = self.fetch8(bus)?;
+                    if modrm & 0xF8 == 0xD0 {
+                        let target = self.regs.gpr[(modrm & 7) as usize];
+                        let ret = self.regs.eip;
+                        self.push(bus, ret)?;
+                        self.regs.eip = target;
+                        continue;
+                    }
                     if modrm != 0x15 {
                         return Err(CpuError::Unimplemented { eip: at, opcode: op });
                     }
