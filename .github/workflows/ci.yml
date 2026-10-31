@@ -40,3 +40,34 @@ jobs:
             target/release/ferrox-gui
             target/release/ferrox-gui.exe
           if-no-files-found: ignore
+
+  package-windows:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ferrox-Windows
+          path: win
+      - name: Package and publish to the builds branch
+        run: |
+          sha=$(echo "$GITHUB_SHA" | cut -c1-7)
+          dir="ferrox-windows-$sha"
+          mkdir "$dir"
+          cp win/ferrox.exe win/ferrox-gui.exe "$dir/"
+          sed 's/$/\r/' packaging/windows/run-tests.bat > "$dir/run-tests.bat"
+          sed 's/$/\r/' packaging/windows/README.txt > "$dir/README.txt"
+          zip -qr "ferrox-windows-$sha.zip" "$dir"
+          git config user.name "ferrox-ci"
+          git config user.email "ci@users.noreply.github.com"
+          git checkout --orphan builds
+          git rm -rf -q . || true
+          cp "ferrox-windows-$sha.zip" .
+          echo "Latest Windows test build: ferrox-windows-$sha.zip" > README.md
+          git add "ferrox-windows-$sha.zip" README.md
+          git commit -q -m "Windows test build $sha"
+          git push -f origin builds

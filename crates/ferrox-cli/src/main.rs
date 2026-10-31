@@ -12,7 +12,7 @@ usage:
   ferrox ls <file.iso>                  list the files on a disc image
   ferrox pushbuffer <file> [get] [put]  decode a raw NV2A pushbuffer dump
                                         (get/put are hex byte offsets)
-  ferrox run <file.xbe|file.iso> [--hdd image] [--reference-cpu] [--save-frame out.ppm]
+  ferrox run <file.xbe|file.iso> [--hdd image] [--reference-cpu] [--save-frame out.png|out.ppm]
                                         run a game with no BIOS (needs KVM on Linux)
   ferrox hdd <new-image> [GiB]          create a formatted blank hard-drive image
   ferrox demo <folder>                  write a tiny demo game into <folder>/Demo";
@@ -40,10 +40,15 @@ fn run_cmd(args: &[String]) -> Result<(), String> {
     let rep = ferrox_system::run(&cfg, &Arc::new(AtomicBool::new(false)), |s| print!("{s}"), |f| last = Some(f))?;
     if let Some(path) = save_frame {
         let f = last.ok_or("the game never displayed a picture")?;
-        let mut out = format!("P6\n{} {}\n255\n", f.width, f.height).into_bytes();
-        for px in f.rgba.chunks_exact(4) {
-            out.extend_from_slice(&px[..3]);
-        }
+        let out = if path.to_lowercase().ends_with(".png") {
+            f.to_png()
+        } else {
+            let mut o = format!("P6\n{} {}\n255\n", f.width, f.height).into_bytes();
+            for px in f.rgba.chunks_exact(4) {
+                o.extend_from_slice(&px[..3]);
+            }
+            o
+        };
         std::fs::write(&path, out).map_err(|e| e.to_string())?;
         eprintln!("saved {}x{} picture to {path}", f.width, f.height);
     }

@@ -36,6 +36,61 @@ fn snapshot(mem: &mut PhysMem, fb: &Framebuffer) -> Option<Frame> {
     Some(Frame { width: fb.width, height: fb.height, rgba })
 }
 
+impl Frame {
+    /// Encodes the picture as an uncompressed PNG (large but dependency-free).
+    pub fn to_png(&self) -> Vec<u8> {
+        fn crc32(data: &[u8]) -> u32 {
+            let mut c = 0xFFFF_FFFFu32;
+            for &b in data {
+                c ^= b as u32;
+                for _ in 0..8 {
+                    c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+                }
+            }
+            !c
+        }
+        fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            let mut body = kind.to_vec();
+            body.extend_from_slice(data);
+            out.extend_from_slice(&body);
+            out.extend_from_slice(&crc32(&body).to_be_bytes());
+        }
+        // raw scanlines: filter byte 0, then RGB
+        let mut raw = Vec::with_capacity((self.width as usize * 3 + 1) * self.height as usize);
+        for row in self.rgba.chunks_exact(self.width as usize * 4) {
+            raw.push(0);
+            for px in row.chunks_exact(4) {
+                raw.extend_from_slice(&px[..3]);
+            }
+        }
+        // zlib stream of stored (uncompressed) deflate blocks
+        let mut z = vec![0x78, 0x01];
+        let blocks: Vec<&[u8]> = raw.chunks(65535).collect();
+        for (i, b) in blocks.iter().enumerate() {
+            z.push(if i + 1 == blocks.len() { 1 } else { 0 });
+            z.extend_from_slice(&(b.len() as u16).to_le_bytes());
+            z.extend_from_slice(&(!(b.len() as u16)).to_le_bytes());
+            z.extend_from_slice(b);
+        }
+        let (mut a, mut bsum) = (1u32, 0u32);
+        for &x in &raw {
+            a = (a + x as u32) % 65521;
+            bsum = (bsum + a) % 65521;
+        }
+        z.extend_from_slice(&(bsum << 16 | a).to_be_bytes());
+        let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&self.width.to_be_bytes());
+        ihdr.extend_from_slice(&self.height.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+        chunk(&mut out, b"IHDR", &ihdr);
+        chunk(&mut out, b"IDAT", &z);
+        chunk(&mut out, b"IEND", &[]);
+        out
+    }
+}
+
 /// What to run.
 #[derive(Clone, Debug)]
 pub enum Source {
@@ -200,9 +255,11 @@ fn make_backend(
 pub fn run(
     cfg: &Config,
     stop: &Arc<AtomicBool>,
-    mut on_output: impl FnMut(&str),
+    on_output: impl FnMut(&str),
     mut on_frame: impl FnMut(Frame),
 ) -> Result<Report, String> {
+    let on_output = std::cell::RefCell::new(on_output);
+    let say = |text: &str| (on_output.borrow_mut())(text);
     if let Some(h) = &cfg.hdd {
         let parts = ferrox_formats::hdd::inspect(h).map_err(|e| format!("hard-drive image: {e}"))?;
         if parts.iter().all(|&(_, ok)| !ok) {
@@ -229,16 +286,25 @@ pub fn run(
     r.eip = loaded.entry;
     cpu.set_regs(r);
     let backend = cpu.name();
+    say(&format!("[ferrox] {title} - CPU: {backend}\n"));
 
-    let mut flush = |state: &std::rc::Rc<std::cell::RefCell<KernelState>>| {
+    let flush = |state: &std::rc::Rc<std::cell::RefCell<KernelState>>| {
         let mut s = state.borrow_mut();
         if !s.debug.is_empty() {
-            on_output(&std::mem::take(&mut s.debug));
+            say(&std::mem::take(&mut s.debug));
         }
     };
+    let mut announced = false;
     let mut last_frame = std::time::Instant::now() - std::time::Duration::from_secs(1);
     let mut show = |mem: &mut PhysMem, force: bool| {
         let Some(fb) = state.borrow().framebuffer else { return };
+        if !announced {
+            announced = true;
+            say(&format!(
+                "[ferrox] display set: {}x{}, format {:#x}, buffer at {:#x}\n",
+                fb.width, fb.height, fb.format, fb.addr
+            ));
+        }
         if force || last_frame.elapsed() >= std::time::Duration::from_millis(33) {
             last_frame = std::time::Instant::now();
             if let Some(f) = snapshot(mem, &fb) {
@@ -349,7 +415,10 @@ mod tests {
         let mut out = String::new();
         let mut frames = Vec::new();
         let rep = run(&cfg, &Arc::new(AtomicBool::new(false)), |s| out.push_str(s), |f| frames.push(f)).unwrap();
-        assert_eq!(out, "hello, xbox! (test pattern drawn)\n");
+        let game_out: String = out.lines().filter(|l| !l.starts_with("[ferrox]")).map(|l| format!("{l}\n")).collect();
+        assert_eq!(game_out, "hello, xbox! (test pattern drawn)\n");
+        assert!(out.contains("display set: 640x480"), "{out}");
+        assert!(out.contains("CPU: reference"), "{out}");
         let last = frames.last().expect("the demo displays a picture");
         assert_eq!((last.width, last.height), (640, 480));
         assert_eq!(last.rgba.len(), 640 * 480 * 4);
@@ -358,6 +427,21 @@ mod tests {
         assert_eq!(rep.outcome, Outcome::GuestStopped("HalReturnToFirmware(0)".into()));
         assert!(rep.backend.starts_with("reference"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn png_output_is_a_valid_image() {
+        let f = Frame { width: 3, height: 2, rgba: (0..24).map(|i| i as u8 * 10).collect() };
+        let png = f.to_png();
+        let dir = std::env::temp_dir().join(format!("ferrox-png-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.png");
+        std::fs::write(&path, &png).unwrap();
+        // python's zlib and struct are not available in this crate; check the structure instead
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        assert_eq!(&png[12..16], b"IHDR");
+        assert_eq!(&png[png.len() - 8..png.len() - 4], b"IEND");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

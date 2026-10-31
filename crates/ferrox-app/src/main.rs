@@ -242,6 +242,18 @@ impl App {
             ui.vertical_centered(|ui| {
                 ui.label(RichText::new("No games yet").size(22.0));
                 ui.label(RichText::new("Add a folder that holds .iso / .xiso files or game folders with a default.xbe.").color(MUTED));
+                ui.add_space(12.0);
+                if ui.button("Create the demo game (test pattern)").clicked() {
+                    let dir = config_dir().join("demo-games");
+                    let game = dir.join("Demo");
+                    if std::fs::create_dir_all(&game).is_ok()
+                        && std::fs::write(game.join("default.xbe"), ferrox_system::demo_xbe()).is_ok()
+                    {
+                        self.settings.library_folders.push(dir);
+                        self.save();
+                        self.rescan();
+                    }
+                }
             });
             return;
         }
@@ -299,7 +311,7 @@ impl App {
                 ui.painter().text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
-                    "No picture\nThe game has not set up a display, or it draws with the GPU,\nwhich is not emulated yet.",
+                    "No picture yet\nIf the game is running: it has not asked for a display,\nor it draws with the GPU, which is not emulated.\nThe console below shows what happened.",
                     egui::FontId::proportional(15.0),
                     MUTED,
                 );
@@ -405,7 +417,7 @@ impl App {
     }
 
     fn about(&self, ui: &mut egui::Ui) {
-        ui.heading(format!("ferrox {}", env!("CARGO_PKG_VERSION")));
+        ui.heading(format!("ferrox {} (build {})", env!("CARGO_PKG_VERSION"), env!("FERROX_BUILD")));
         ui.label("An original-Xbox emulator in Rust. GPL-2.0-or-later.");
         ui.add_space(8.0);
         ui.label(RichText::new("What works today").strong());
@@ -436,7 +448,7 @@ impl eframe::App for App {
         egui::SidePanel::left("nav").exact_width(150.0).show(ctx, |ui| {
             ui.add_space(8.0);
             ui.label(RichText::new("ferrox").size(26.0).strong().color(ACCENT));
-            ui.label(RichText::new(concat!("v", env!("CARGO_PKG_VERSION"))).color(MUTED));
+            ui.label(RichText::new(concat!("v", env!("CARGO_PKG_VERSION"), "  ", env!("FERROX_BUILD"))).color(MUTED));
             ui.add_space(14.0);
             for (tab, label) in [(Tab::Library, "Library"), (Tab::Play, "Play"), (Tab::Settings, "Settings"), (Tab::About, "About")] {
                 if ui.selectable_label(self.tab == tab, RichText::new(label).size(17.0)).clicked() {
@@ -459,7 +471,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        concat!("ferrox v", env!("CARGO_PKG_VERSION")),
+        concat!("ferrox v", env!("CARGO_PKG_VERSION"), " (build ", env!("FERROX_BUILD"), ")"),
         opts,
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
     )
