@@ -757,8 +757,8 @@ mod tests {
         let routine_patch = a.code.len() + 6; // the routine is the second argument, pushed second
         a.call("KeInitializeDpc", &[DPC, 0, 0]);
         a.call("KeInitializeTimerEx", &[TIMER, 0]);
-        // due in 20 ms (-200000 x 100 ns), then every 5 ms, forever
-        a.call("KeSetTimerEx", &[TIMER, (-200_000i32) as u32, 0xFFFF_FFFF, 5, DPC]);
+        // due in 3 ms (-30000 x 100 ns), then every 1 ms, forever
+        a.call("KeSetTimerEx", &[TIMER, (-30_000i32) as u32, 0xFFFF_FFFF, 1, DPC]);
         a.call("KeWaitForSingleObject", &[EV, 0, 0, 0, 0]);
         a.store_eax(0);
         a.raw(&[0xF4]);
@@ -770,7 +770,7 @@ mod tests {
         let (mut mem, _, exit) = run_with(a, &[], |h| h.sched.use_real_clock());
         assert_eq!(exit, Exit::Halt);
         assert_eq!(out(&mut mem, 0), 0, "the wait ended normally");
-        assert!(started.elapsed().as_millis() >= 15, "the timer's time really passed");
+        assert!(started.elapsed().as_millis() >= 2, "the timer's time really passed");
     }
 
     #[test]
