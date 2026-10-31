@@ -123,6 +123,13 @@ impl From<BusError> for HleError {
 #[derive(Default)]
 pub struct KernelHle {
     exports: HashMap<u32, Export>,
+    /// When set, a call to an export with no handler is recorded and answered with
+    /// STATUS_SUCCESS (0) instead of stopping the run. For compatibility probing.
+    lenient: bool,
+    /// How often each export was called.
+    counts: HashMap<u32, u64>,
+    /// Calls to exports with no handler (only filled in lenient mode).
+    missing: HashMap<u32, u64>,
 }
 
 /// Where the loaded image starts running, and what the loader did.
@@ -155,6 +162,33 @@ impl KernelHle {
             );
         }
         k
+    }
+
+    /// Keep going past calls to exports nobody implemented, recording them (see `missing_calls`).
+    pub fn set_lenient(&mut self, lenient: bool) {
+        self.lenient = lenient;
+    }
+
+    /// Exports the game called that have no handler yet: (name, ordinal, calls), most-called first.
+    pub fn missing_calls(&self) -> Vec<(&'static str, u32, u64)> {
+        let mut v: Vec<_> = self
+            .missing
+            .iter()
+            .map(|(&o, &n)| (self.exports.get(&o).map_or("?", |e| e.name), o, n))
+            .collect();
+        v.sort_by(|a, b| b.2.cmp(&a.2).then(a.1.cmp(&b.1)));
+        v
+    }
+
+    /// Exports that were called and have a handler: (name, calls), most-called first.
+    pub fn implemented_calls(&self) -> Vec<(&'static str, u64)> {
+        let mut v: Vec<_> = self
+            .counts
+            .iter()
+            .filter_map(|(&o, &n)| self.exports.get(&o).filter(|e| e.handler.is_some()).map(|e| (e.name, n)))
+            .collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        v
     }
 
     /// Implements the table entry called `name`. Panics if there is no such
@@ -267,14 +301,22 @@ impl KernelHle {
             let n = budget.min(SLICE);
             match cpu.run(bus, n).map_err(|e: CpuError| HleError::Cpu(e.to_string()))? {
                 Exit::Hypercall(ordinal) => {
-                    let ex = self
-                        .exports
-                        .get_mut(&ordinal)
-                        .ok_or(HleError::UnimplementedCall { ordinal, name: "?" })?;
-                    let handler = ex
-                        .handler
-                        .as_mut()
-                        .ok_or(HleError::UnimplementedCall { ordinal, name: ex.name })?;
+                    *self.counts.entry(ordinal).or_default() += 1;
+                    let lenient = self.lenient;
+                    if !self.exports.get(&ordinal).is_some_and(|e| e.handler.is_some()) {
+                        if !lenient {
+                            let name = self.exports.get(&ordinal).map_or("?", |e| e.name);
+                            return Err(HleError::UnimplementedCall { ordinal, name });
+                        }
+                        *self.missing.entry(ordinal).or_default() += 1;
+                        let mut regs = cpu.regs();
+                        regs.gpr[0] = 0;
+                        cpu.set_regs(regs);
+                        budget -= 1;
+                        continue;
+                    }
+                    let ex = self.exports.get_mut(&ordinal).expect("checked above");
+                    let handler = ex.handler.as_mut().expect("checked above");
                     let mut regs = cpu.regs();
                     let mut call = Call { regs: &mut regs, bus, stop: false };
                     let result = handler(&mut call);

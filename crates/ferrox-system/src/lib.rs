@@ -4,6 +4,7 @@
 //! `ferrox-hle` answers kernel calls, and the CPU is whatever backend the host
 //! offers. Hardware mode (real boot ROM and BIOS) will plug in here later.
 
+use ferrox_core::Bus;
 use ferrox_cpu::{CpuBackend, Exit, RefCpu, ESP};
 use ferrox_formats::xbe::Xbe;
 use ferrox_formats::xdvdfs::Xdvdfs;
@@ -104,18 +105,86 @@ pub enum Source {
     Xbe(PathBuf),
     /// A disc image; its `default.xbe` is run.
     Iso(PathBuf),
+    /// A folder holding an extracted game; its `default.xbe` is run.
+    Folder(PathBuf),
 }
 
 impl Source {
     /// Chooses by file extension: `.xbe` is an executable, anything else a disc.
     pub fn from_path(p: &Path) -> Source {
+        if p.is_dir() {
+            return Source::Folder(p.to_path_buf());
+        }
         let is_xbe = p.extension().is_some_and(|e| e.eq_ignore_ascii_case("xbe"));
         if is_xbe { Source::Xbe(p.to_path_buf()) } else { Source::Iso(p.to_path_buf()) }
+    }
+
+    /// Finds the game behind a path the user typed: a file, a folder with `default.xbe`, a
+    /// folder holding a disc image, or a name whose extension was left off.
+    pub fn resolve(p: &Path) -> Result<Source, String> {
+        let is_disc = |q: &Path| {
+            q.extension().is_some_and(|e| ["iso", "xiso", "xbe"].iter().any(|x| e.eq_ignore_ascii_case(x)))
+        };
+        let list = |d: &Path| -> Vec<PathBuf> {
+            let mut v: Vec<PathBuf> = std::fs::read_dir(d).map(|r| r.filter_map(|e| e.ok()).map(|e| e.path()).collect()).unwrap_or_default();
+            v.sort();
+            v
+        };
+        if p.is_file() {
+            return Ok(Source::from_path(p));
+        }
+        if p.is_dir() {
+            let entries = list(p);
+            let has_xbe = entries.iter().any(|q| q.file_name().is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("default.xbe")));
+            if has_xbe {
+                return Ok(Source::Folder(p.to_path_buf()));
+            }
+            if let Some(q) = entries.iter().find(|q| q.is_file() && is_disc(q)) {
+                return Ok(Source::from_path(q));
+            }
+            for sub in entries.iter().filter(|q| q.is_dir()) {
+                let inner = list(sub);
+                if inner.iter().any(|q| q.file_name().is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("default.xbe"))) {
+                    return Ok(Source::Folder(sub.clone()));
+                }
+                if let Some(q) = inner.iter().find(|q| q.is_file() && is_disc(q)) {
+                    return Ok(Source::from_path(q));
+                }
+            }
+            let names: Vec<String> = entries.iter().take(12).map(|q| q.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).collect();
+            return Err(format!("no default.xbe, .xbe, .iso or .xiso found in {} (it holds: {})", p.display(), names.join(", ")));
+        }
+        for ext in ["iso", "xiso", "xbe", "ISO"] {
+            let mut name = p.as_os_str().to_os_string();
+            name.push(".");
+            name.push(ext);
+            let q = PathBuf::from(name);
+            if q.is_file() {
+                return Ok(Source::from_path(&q));
+            }
+        }
+        let near: Vec<String> = match (p.parent(), p.file_name()) {
+            (Some(dir), Some(stem)) => {
+                let stem = stem.to_string_lossy().to_lowercase();
+                let first = stem.chars().take(6).collect::<String>();
+                list(dir).iter().filter_map(|q| q.file_name().map(|n| n.to_string_lossy().into_owned())).filter(|n| n.to_lowercase().starts_with(&first)).take(8).collect()
+            }
+            _ => Vec::new(),
+        };
+        Err(format!("{} was not found{}", p.display(), if near.is_empty() { String::new() } else { format!(" (similar names there: {})", near.join(", ")) }))
     }
 
     pub fn read_xbe(&self) -> Result<Vec<u8>, String> {
         match self {
             Source::Xbe(p) => std::fs::read(p).map_err(|e| format!("cannot read {}: {e}", p.display())),
+            Source::Folder(p) => {
+                let found = std::fs::read_dir(p)
+                    .map_err(|e| format!("cannot read folder {}: {e}", p.display()))?
+                    .filter_map(|e| e.ok())
+                    .find(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case("default.xbe"))
+                    .ok_or_else(|| format!("{} has no default.xbe", p.display()))?;
+                std::fs::read(found.path()).map_err(|e| format!("cannot read {}: {e}", found.path().display()))
+            }
             Source::Iso(p) => {
                 let f = File::open(p).map_err(|e| format!("cannot open {}: {e}", p.display()))?;
                 let mut disc = Xdvdfs::open(BufReader::new(f)).map_err(|e| e.to_string())?;
@@ -144,6 +213,9 @@ pub struct Config {
     /// Hard-drive image to attach. Checked now; the guest will see it once the
     /// high-level kernel implements file access.
     pub hdd: Option<PathBuf>,
+    /// Compatibility probe: keep going past kernel functions that are not written yet, stop
+    /// after this long, and print a report of what the game did.
+    pub probe: Option<std::time::Duration>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -154,6 +226,10 @@ pub enum Outcome {
     Halted,
     /// The user pressed stop.
     Stopped,
+    /// A probe ran out of time while the game was still running.
+    TimedOut,
+    /// The CPU or the machine could not continue (probe mode reports this instead of failing).
+    Crashed(String),
 }
 
 impl std::fmt::Display for Outcome {
@@ -162,6 +238,8 @@ impl std::fmt::Display for Outcome {
             Outcome::GuestStopped(why) => write!(f, "the game stopped itself ({why})"),
             Outcome::Halted => write!(f, "the game halted"),
             Outcome::Stopped => write!(f, "stopped by you"),
+            Outcome::TimedOut => write!(f, "still running when the probe's time ran out"),
+            Outcome::Crashed(why) => write!(f, "could not continue ({why})"),
         }
     }
 }
@@ -290,6 +368,7 @@ pub fn run(
         .map_err(|e| e.to_string())?;
     let mut hle = KernelHle::with_table();
     let state: std::rc::Rc<std::cell::RefCell<KernelState>> = kernel::install(&mut hle, HEAP);
+    hle.set_lenient(cfg.probe.is_some());
     let loaded = hle.load(&mut mem, &xbe, &file, LAYOUT).map_err(|e| e.to_string())?;
 
     trace("image loaded, creating the CPU backend");
@@ -330,9 +409,13 @@ pub fn run(
             }
         }
     };
+    let started = std::time::Instant::now();
     let outcome = loop {
         if stop.load(Ordering::Relaxed) {
             break Outcome::Stopped;
+        }
+        if cfg.probe.is_some_and(|limit| started.elapsed() >= limit) {
+            break Outcome::TimedOut;
         }
         match hle.run(cpu.as_mut(), &mut mem, 1_000_000) {
             Ok(Exit::Budget) => {
@@ -350,12 +433,18 @@ pub fn run(
             Err(e) => {
                 flush(&state);
                 show(&mut mem, true);
-                return Err(e.to_string());
+                if cfg.probe.is_none() {
+                    return Err(e.to_string());
+                }
+                break Outcome::Crashed(e.to_string());
             }
         }
     };
     flush(&state);
     show(&mut mem, true);
+    if cfg.probe.is_some() {
+        probe_report(&say, &xbe, &file, &hle, &outcome, started.elapsed(), cpu.as_mut(), &mut mem);
+    }
     let missed = gpu_state.unhandled();
     if !missed.is_empty() {
         let list: Vec<String> = missed
@@ -389,6 +478,66 @@ pub fn run(
         ));
     }
     Ok(Report { outcome, backend, title })
+}
+
+/// Prints what a probe run learned: how the executable is built, which kernel functions it used,
+/// which of those are missing, and where the CPU was when the run ended.
+#[allow(clippy::too_many_arguments)]
+fn probe_report(
+    say: &dyn Fn(&str),
+    xbe: &Xbe,
+    file: &[u8],
+    hle: &KernelHle,
+    outcome: &Outcome,
+    elapsed: std::time::Duration,
+    cpu: &mut dyn CpuBackend,
+    mem: &mut PhysMem,
+) {
+    say("[probe] ---- compatibility report ----\n");
+    say(&format!(
+        "[probe] title: {}, base {:#x}, image {:#x} bytes, entry {:#x}, {} sections\n",
+        xbe.certificate.title_name, xbe.base_addr, xbe.size_of_image, xbe.entry_point, xbe.sections.len()
+    ));
+    if let Ok(ords) = xbe.kernel_imports(file) {
+        let names: Vec<(u32, &str)> = ords.iter().map(|&o| (o, hle.name_of(o).unwrap_or("?"))).collect();
+        let missing: Vec<String> = names.iter().filter(|(_, n)| !hle.is_implemented(n)).map(|(o, n)| format!("{n}(#{o})")).collect();
+        say(&format!(
+            "[probe] imports {} kernel functions/objects, {} of them not written yet\n",
+            names.len(),
+            missing.len()
+        ));
+        if !missing.is_empty() {
+            say(&format!("[probe] imported but not written yet: {}\n", missing.join(", ")));
+        }
+    }
+    let called = hle.missing_calls();
+    if called.is_empty() {
+        say("[probe] no calls to missing kernel functions\n");
+    } else {
+        let list: Vec<String> = called.iter().take(40).map(|(n, o, c)| format!("{n}(#{o}) x{c}")).collect();
+        say(&format!("[probe] MISSING kernel functions the game actually called (each answered with 0): {}\n", list.join(", ")));
+    }
+    let used = hle.implemented_calls();
+    let total: u64 = used.iter().map(|x| x.1).sum();
+    let list: Vec<String> = used.iter().take(25).map(|(n, c)| format!("{n} x{c}")).collect();
+    say(&format!("[probe] kernel functions that worked: {total} calls: {}\n", list.join(", ")));
+    say(&format!("[probe] outcome after {:.1} s: {outcome}\n", elapsed.as_secs_f32()));
+    let r = cpu.regs();
+    say(&format!(
+        "[probe] cpu: eip {:#010x} esp {:#010x} eax {:#x} ebx {:#x} ecx {:#x} edx {:#x} esi {:#x} edi {:#x} ebp {:#x}\n",
+        r.eip, r.gpr[ESP], r.gpr[0], r.gpr[3], r.gpr[1], r.gpr[2], r.gpr[6], r.gpr[7], r.gpr[5]
+    ));
+    let mut code = [0u8; 16];
+    for (i, b) in code.iter_mut().enumerate() {
+        *b = mem.read(r.eip as u64 + i as u64, 1).unwrap_or(0) as u8;
+    }
+    say(&format!("[probe] bytes at eip: {}\n", code.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")));
+    let mut stack = Vec::new();
+    for i in 0..8u64 {
+        stack.push(format!("{:#x}", mem.read(r.gpr[ESP] as u64 + 4 * i, 4).unwrap_or(0)));
+    }
+    say(&format!("[probe] top of stack: {}\n", stack.join(" ")));
+    say("[probe] ---- end of report ----\n");
 }
 
 /// A tiny demo executable: allocates a 640x480 framebuffer, selects it as the
@@ -629,7 +778,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("test.xbe");
         std::fs::write(&path, demo_xbe()).unwrap();
-        let cfg = Config { source: Source::from_path(&path), backend: Backend::Reference, hdd: None };
+        let cfg = Config { source: Source::from_path(&path), backend: Backend::Reference, hdd: None, probe: None };
         let mut out = String::new();
         let mut frames = Vec::new();
         let rep = run(&cfg, &Arc::new(AtomicBool::new(false)), |s| out.push_str(s), |f| frames.push(f)).unwrap();
@@ -676,6 +825,60 @@ mod tests {
     }
 
     #[test]
+    fn a_probe_survives_and_lists_missing_kernel_functions() {
+        let dir = std::env::temp_dir().join(format!("ferrox-sys3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let name = "ObReferenceObjectByHandle";
+        assert!(!{
+            let mut h = KernelHle::with_table();
+            kernel::install(&mut h, HEAP);
+            h.is_implemented(name)
+        }, "pick another unimplemented export for this test");
+        let mut file = build(true, &[exports::by_name(name).unwrap().ordinal]);
+        let slot = ferrox_formats::xbe::synth::BASE + 0x2000;
+        let mut code = vec![0xFF, 0x15];
+        code.extend(slot.to_le_bytes());
+        code.extend([0xFF, 0x15]);
+        code.extend(slot.to_le_bytes());
+        code.push(0xF4); // hlt
+        file[0x1000..0x1000 + code.len()].copy_from_slice(&code);
+        let path = dir.join("missing.xbe");
+        std::fs::write(&path, &file).unwrap();
+        let mut cfg = Config { source: Source::Xbe(path), backend: Backend::Reference, hdd: None, probe: None };
+        // without a probe the first missing call is an error naming the function
+        let err = run(&cfg, &Arc::new(AtomicBool::new(false)), |_| {}, |_| {}).unwrap_err();
+        assert!(err.contains(name), "{err}");
+        cfg.probe = Some(std::time::Duration::from_secs(5));
+        let mut out = String::new();
+        let rep = run(&cfg, &Arc::new(AtomicBool::new(false)), |s| out.push_str(s), |_| {}).unwrap();
+        assert_eq!(rep.outcome, Outcome::Halted, "{out}");
+        assert!(out.contains(&format!("{name}(#")) && out.contains("x2"), "{out}");
+        assert!(out.contains("MISSING kernel functions"), "{out}");
+    }
+
+    #[test]
+    fn typed_game_paths_are_resolved_forgivingly() {
+        let root = std::env::temp_dir().join(format!("ferrox-resolve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for d in ["extracted", "boxed/inner", "empty"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(root.join("extracted/Default.xbe"), b"x").unwrap();
+        std::fs::write(root.join("boxed/inner/game.xiso"), b"x").unwrap();
+        std::fs::write(root.join("Named Game (USA).iso"), b"x").unwrap();
+        let r = |p: &str| Source::resolve(&root.join(p));
+        assert!(matches!(r("extracted"), Ok(Source::Folder(_))));
+        assert!(matches!(r("boxed"), Ok(Source::Iso(p)) if p.ends_with("game.xiso")));
+        assert!(matches!(r("Named Game (USA)"), Ok(Source::Iso(p)) if p.ends_with("Named Game (USA).iso")));
+        assert!(matches!(r("Named Game (USA).iso"), Ok(Source::Iso(_))));
+        let e = r("empty").unwrap_err();
+        assert!(e.contains("no default.xbe"), "{e}");
+        let e = r("Named Gam").unwrap_err();
+        assert!(e.contains("not found") && e.contains("Named Game (USA).iso"), "{e}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn stop_flag_ends_a_runaway_game() {
         let dir = std::env::temp_dir().join(format!("ferrox-sys2-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -683,7 +886,7 @@ mod tests {
         let mut file = build(true, &[exports::by_name("NtClose").unwrap().ordinal]);
         file[0x1000..0x1002].copy_from_slice(&[0xEB, 0xFE]); // jmp $
         std::fs::write(&path, file).unwrap();
-        let cfg = Config { source: Source::Xbe(path), backend: Backend::Reference, hdd: None };
+        let cfg = Config { source: Source::Xbe(path), backend: Backend::Reference, hdd: None, probe: None };
         let stop = Arc::new(AtomicBool::new(false));
         let s2 = stop.clone();
         let t = std::thread::spawn(move || {
@@ -702,6 +905,7 @@ mod tests {
             source: Source::Xbe("/nonexistent/x.xbe".into()),
             backend: Backend::Reference,
             hdd: None,
+            probe: None,
         };
         assert!(run(&cfg, &Arc::new(AtomicBool::new(false)), |_| {}, |_| {}).unwrap_err().contains("cannot read"));
     }

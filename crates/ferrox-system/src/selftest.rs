@@ -119,7 +119,7 @@ struct Outcome {
 }
 
 fn run_once(source: Source, backend: Backend, hdd: Option<std::path::PathBuf>) -> Result<Outcome, String> {
-    let cfg = Config { source, backend, hdd };
+    let cfg = Config { source, backend, hdd, probe: None };
     let mut out = String::new();
     let mut frame = None;
     let t = Instant::now();

@@ -14,6 +14,11 @@ usage:
                                         (get/put are hex byte offsets)
   ferrox run <file.xbe|file.iso> [--hdd image] [--reference-cpu] [--save-frame out.png|out.ppm]
                                         run a game with no BIOS (needs KVM on Linux)
+  ferrox probe <game> [--seconds N] [--hdd image] [--reference-cpu] [--save-frame out.png]
+                                        compatibility probe: runs the game for N seconds (default 20),
+                                        keeps going past kernel functions that are not written yet and
+                                        prints a report of what the game did. <game> may be an .xbe, a
+                                        disc image (.iso/xiso) or a folder containing default.xbe
   ferrox hdd <new-image> [GiB]          create a formatted blank hard-drive image
   ferrox demo <folder>                  write a tiny demo game into <folder>/Demo
   ferrox selftest [--no-hardware|--hardware] [folder]
@@ -24,9 +29,10 @@ fn run_cmd(args: &[String]) -> Result<(), String> {
     use std::sync::Arc;
     let path = args.first().ok_or("run needs a file")?;
     let mut cfg = ferrox_system::Config {
-        source: ferrox_system::Source::from_path(std::path::Path::new(path)),
+        source: ferrox_system::Source::resolve(std::path::Path::new(path))?,
         backend: ferrox_system::Backend::Auto,
         hdd: None,
+        probe: None,
     };
     let mut save_frame: Option<String> = None;
     let mut it = args[1..].iter();
@@ -34,6 +40,10 @@ fn run_cmd(args: &[String]) -> Result<(), String> {
         match a.as_str() {
             "--hdd" => cfg.hdd = Some(it.next().ok_or("--hdd needs a path")?.into()),
             "--reference-cpu" => cfg.backend = ferrox_system::Backend::Reference,
+            "--probe" => {
+                let secs: f32 = it.next().ok_or("--probe needs a number of seconds")?.parse().map_err(|_| "--probe needs a number of seconds")?;
+                cfg.probe = Some(std::time::Duration::from_secs_f32(secs.max(0.1)));
+            }
             "--save-frame" => save_frame = Some(it.next().ok_or("--save-frame needs a path")?.clone()),
             other => return Err(format!("unknown option {other}")),
         }
@@ -216,6 +226,21 @@ fn main() -> ExitCode {
             .and_then(|p| ls(p).map_err(|e| e.to_string())),
         Some("pushbuffer") => pushbuffer(&args[1..]),
         Some("run") => run_cmd(&args[1..]),
+        Some("probe") => {
+            // `--seconds N` is the friendly spelling of `--probe N`; 20 seconds by default
+            let mut rest: Vec<String> = Vec::new();
+            let mut seconds = "20".to_string();
+            let mut it = args[1..].iter();
+            while let Some(a) = it.next() {
+                if a == "--seconds" {
+                    seconds = it.next().cloned().unwrap_or(seconds);
+                } else {
+                    rest.push(a.clone());
+                }
+            }
+            rest.extend(["--probe".to_string(), seconds]);
+            run_cmd(&rest)
+        }
         Some("hdd") => hdd_cmd(&args[1..]),
         Some("demo") => demo_cmd(&args[1..]),
         Some("selftest") => selftest_cmd(&args[1..]),

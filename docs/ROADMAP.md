@@ -18,7 +18,7 @@ hard-drive images, CLI `run`/`hdd`/`demo`.
 2. Kernel: threads and scheduling, events/semaphores/mutexes, DPCs and interrupts,
    file access (`NtCreateFile` and friends over the disc image and FATX drive E:).
 3. A homebrew program built with nxdk that only uses text output runs end to end.
-4. Then M3/M4 below (GPU). Done so far: the command queue, colour clears and a software triangle rasteriser,  the vertex program and vertex arrays too; depth testing and textures too; register combiners, alpha test, blending and the colour mask too; next are mipmaps, texture stages 1-3, the stencil test, fog, the fixed-function transform, then a Vulkan backend.
+4. Then M3/M4 below (GPU). Done so far: the command queue, colour clears and a software triangle rasteriser,  the vertex program and vertex arrays too; depth testing and textures too; register combiners, alpha test, blending and the colour mask too; next: game-driven work. `ferrox probe <game>` runs a real game for N seconds, keeps going past kernel functions that are not written yet and prints what it called, what is missing and where it stopped; the Windows test script runs it on a game of your choice and the reports decide the next kernel functions. Then mipmaps (sampler done, not yet wired), texture stages 1-3, the stencil test, fog, the fixed-function transform, then a Vulkan backend.
 5. WHPX (Windows) and HVF (macOS) backends; qcow2 reading for xemu-made images.
 
 ## M1 — Run guest code

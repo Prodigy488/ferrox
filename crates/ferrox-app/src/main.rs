@@ -145,6 +145,7 @@ impl App {
             source: Source::from_path(&game.path),
             backend: if self.settings.use_reference_cpu { Backend::Reference } else { Backend::Auto },
             hdd: self.settings.hdd_image.clone(),
+            probe: None,
         };
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = channel();
