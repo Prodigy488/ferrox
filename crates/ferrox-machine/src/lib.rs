@@ -145,6 +145,9 @@ enum Backing {
     /// Read-only bytes; shared so a ROM can appear at several mirrored addresses.
     Rom(Arc<PageBuf>),
     Mmio(Box<dyn Mmio>),
+    /// Another address range showing the same bytes as RAM at `target` (the console maps its
+    /// memory again at 0x80000000 and 0xF0000000).
+    Alias { target: u64 },
 }
 
 struct Region {
@@ -237,9 +240,52 @@ impl PhysMem {
                     host_ptr: v.as_ptr() as *mut u8, // read-only slot: never written through
                     read_only: true,
                 }),
-                Backing::Mmio(_) => None,
+                Backing::Mmio(_) | Backing::Alias { .. } => None,
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .chain(self.alias_slots())
+            .collect()
+    }
+
+    /// Maps `size` bytes at `base` onto the RAM that starts at `target`.
+    pub fn add_alias(&mut self, base: u64, size: u64, target: u64) -> Result<(), MapError> {
+        self.insert(base, size, Backing::Alias { target })
+    }
+
+    fn alias_slots(&mut self) -> Vec<MemSlot> {
+        let aliases: Vec<(u64, u64, u64)> = self
+            .regions
+            .iter()
+            .filter_map(|r| match r.backing {
+                Backing::Alias { target } => Some((r.base, r.size, target)),
+                _ => None,
+            })
+            .collect();
+        aliases
+            .into_iter()
+            .filter_map(|(base, size, target)| {
+                let (r, off) = self.find(target, 1)?;
+                match &mut r.backing {
+                    Backing::Ram(v) => Some(MemSlot {
+                        guest_addr: base,
+                        size,
+                        host_ptr: unsafe { v.as_mut_ptr().add(off as usize) },
+                        read_only: false,
+                    }),
+                    _ => None,
+                }
             })
             .collect()
+    }
+
+    /// Where an alias address really lives, if `addr` is in an alias.
+    fn unalias(&mut self, addr: u64) -> Option<u64> {
+        let (r, off) = self.find(addr, 1)?;
+        match r.backing {
+            Backing::Alias { target } => Some(target + off),
+            _ => None,
+        }
     }
 
     /// Borrows `len` bytes of RAM starting at `addr` (for copying out a
@@ -324,6 +370,9 @@ fn check_size(size: usize) -> Result<(), BusError> {
 impl Bus for PhysMem {
     fn read(&mut self, addr: GuestAddr, size: usize) -> Result<u64, BusError> {
         check_size(size)?;
+        if let Some(t) = self.unalias(addr) {
+            return self.read(t, size);
+        }
         let (r, off) = self.find(addr, size).ok_or(BusError::Unmapped(addr))?;
         let bytes = |data: &[u8]| {
             let mut v = 0u64;
@@ -336,11 +385,15 @@ impl Bus for PhysMem {
             Backing::Ram(d) => bytes(d),
             Backing::Rom(d) => bytes(d),
             Backing::Mmio(dev) => dev.read(off, size),
+            Backing::Alias { .. } => unreachable!("aliases are resolved first"),
         })
     }
 
     fn write(&mut self, addr: GuestAddr, size: usize, value: u64) -> Result<(), BusError> {
         check_size(size)?;
+        if let Some(t) = self.unalias(addr) {
+            return self.write(t, size, value);
+        }
         let (r, off) = self.find(addr, size).ok_or(BusError::Unmapped(addr))?;
         match &mut r.backing {
             Backing::Ram(d) => {
@@ -350,6 +403,7 @@ impl Bus for PhysMem {
                 Ok(())
             }
             Backing::Rom(_) => Err(BusError::ReadOnly(addr)),
+            Backing::Alias { .. } => unreachable!("aliases are resolved first"),
             Backing::Mmio(dev) => {
                 dev.write(off, size, value);
                 Ok(())
@@ -358,6 +412,9 @@ impl Bus for PhysMem {
     }
 
     fn read_bytes(&mut self, addr: GuestAddr, buf: &mut [u8]) -> Result<(), BusError> {
+        if let Some(t) = self.unalias(addr) {
+            return self.read_bytes(t, buf);
+        }
         let mut done = 0;
         while done < buf.len() {
             let at = addr + done as u64;
@@ -378,6 +435,9 @@ impl Bus for PhysMem {
     }
 
     fn write_bytes(&mut self, addr: GuestAddr, data: &[u8]) -> Result<(), BusError> {
+        if let Some(t) = self.unalias(addr) {
+            return self.write_bytes(t, data);
+        }
         let mut done = 0;
         while done < data.len() {
             let at = addr + done as u64;
@@ -469,6 +529,20 @@ mod tests {
         assert_eq!(m.read(0x10, 4).unwrap(), 0x1122_3344);
         m.write(0x20, 8, 0x0102_0304_0506_0708).unwrap();
         assert_eq!(m.read(0x24, 4).unwrap(), 0x0102_0304);
+    }
+
+    #[test]
+    fn an_alias_shows_the_same_ram_at_another_address() {
+        let mut m = PhysMem::new();
+        m.add_ram(0, 4096).unwrap();
+        m.add_alias(0x8000_0000, 4096, 0).unwrap();
+        m.write(0x8000_0010, 4, 0xAABB_CCDD).unwrap();
+        assert_eq!(m.read(0x10, 4).unwrap(), 0xAABB_CCDD);
+        m.write(0x20, 2, 0x1234).unwrap();
+        assert_eq!(m.read(0x8000_0020, 2).unwrap(), 0x1234);
+        let mut buf = [0u8; 4];
+        m.read_bytes(0x8000_0010, &mut buf).unwrap();
+        assert_eq!(u32::from_le_bytes(buf), 0xAABB_CCDD);
     }
 
     #[test]

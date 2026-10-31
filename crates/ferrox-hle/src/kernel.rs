@@ -13,6 +13,8 @@ use std::rc::Rc;
 
 pub const STATUS_SUCCESS: u32 = 0;
 pub const STATUS_NO_MEMORY: u32 = 0xC000_0017;
+/// End of the 64 MB of RAM.
+const RAM_TOP: u32 = 64 * 1024 * 1024;
 const PAGE: u32 = 4096;
 
 
@@ -29,6 +31,8 @@ pub struct KernelState {
     pub framebuffer: Option<Framebuffer>,
     /// Value of the 'saved data' pointer games may keep across calls.
     pub saved_data: u32,
+    /// Physical address of the memory claimed for the GPU's instance memory, once claimed.
+    pub instance_memory: Option<u32>,
 }
 
 impl KernelState {
@@ -155,6 +159,19 @@ pub fn install(hle: &mut KernelHle, heap: Range<u32>) -> Rc<RefCell<KernelState>
         s.borrow_mut().alloc(pages(size), align).unwrap_or(0)
     });
     hle.handle("MmFreeContiguousMemory", |_| 0);
+    let s = st.clone();
+    hle.handle("MmClaimGpuInstanceMemory", move |c| {
+        // (NumberOfBytes, NumberOfPaddingBytes*): the top of RAM is set aside for the GPU's
+        // instance memory; the pointer comes back in the console's 0x80000000 view of RAM
+        let (bytes, padding) = (c.arg(0).unwrap_or(0), c.arg(1).unwrap_or(0));
+        let mut st = s.borrow_mut();
+        let size = if bytes == 0xFFFF_FFFF { 0x5000 } else { pages(bytes) };
+        let base = *st.instance_memory.get_or_insert(RAM_TOP - size);
+        if padding != 0 {
+            let _ = c.write_u32(padding, 0);
+        }
+        0x8000_0000 | base
+    });
     hle.handle("MmPersistContiguousMemory", |_| STATUS_SUCCESS);
 
     // --- virtual memory (identity-mapped: an allocation is just RAM) ---

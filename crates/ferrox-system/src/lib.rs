@@ -396,6 +396,10 @@ pub fn run(
     gpu.attach_ram(mem.ram_view(0).ok_or("no memory to give the GPU")?);
     mem.add_mmio(ferrox_nv2a::device::BASE, ferrox_nv2a::device::SIZE, Box::new(gpu))
         .map_err(|e| e.to_string())?;
+    // the console shows its memory again at 0x80000000 and 0xF0000000
+    for alias in [0x8000_0000u64, 0xF000_0000] {
+        mem.add_alias(alias, RAM_BYTES as u64, 0).map_err(|e| e.to_string())?;
+    }
     // chips that are not emulated yet answer with zeros, and are listed in the report
     let mut placeholders: Vec<(&str, u64, ferrox_machine::PlaceholderLog)> = Vec::new();
     for (name, base, size) in PLACEHOLDERS {
@@ -414,8 +418,14 @@ pub fn run(
     // on the GPU's interrupt line (bus level 3 -> vector 0x33)
     {
         let gpu = gpu_state.clone();
+        let kernel_state = state.clone();
         let mut next = 0u64;
         hle.add_interrupt_source(0x33, move |now| {
+            // the kernel setting aside the chip's instance memory: from then on the game's writes
+            // to it are what the chip reads
+            if let Some(base) = kernel_state.borrow().instance_memory {
+                gpu.set_ramin_base(base);
+            }
             if now >= next {
                 gpu.vblank();
                 next = now + 166_667;

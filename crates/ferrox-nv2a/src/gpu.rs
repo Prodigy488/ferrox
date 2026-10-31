@@ -199,6 +199,15 @@ impl Gpu {
     // ---- PRAMIN ----
 
     pub fn ramin_read(&self, off: u64, size: usize) -> u64 {
+        let base = self.shared.ramin_base();
+        if base != 0 {
+            let bytes = self.ram.as_ref().and_then(|r| r.bytes(base as u64 + off, size.min(8)));
+            let mut v = [0u8; 8];
+            if let Some(b) = bytes {
+                v[..b.len()].copy_from_slice(b);
+            }
+            return u64::from_le_bytes(v);
+        }
         let o = off as usize;
         match self.ramin.get(o..o + size.min(8)) {
             Some(b) => {
@@ -211,8 +220,15 @@ impl Gpu {
     }
 
     pub fn ramin_write(&mut self, off: u64, size: usize, value: u64) {
-        let o = off as usize;
         let n = size.min(8);
+        let base = self.shared.ramin_base();
+        if base != 0 {
+            if let Some(r) = &self.ram {
+                r.write(base as u64 + off, &value.to_le_bytes()[..n]);
+            }
+            return;
+        }
+        let o = off as usize;
         if let Some(b) = self.ramin.get_mut(o..o + n) {
             b.copy_from_slice(&value.to_le_bytes()[..n]);
         }
@@ -952,6 +968,21 @@ mod tests {
         let (mut gpu, shared) = Nv2a::new();
         gpu.attach_ram(mem.ram_view(0).unwrap());
         (gpu, shared, mem)
+    }
+
+    #[test]
+    fn instance_memory_shares_bytes_with_ram_once_claimed() {
+        let (mut g, shared, mut mem) = setup();
+        let ram = mem.ram_view(0).unwrap();
+        g.write(0x70_0000 + 8, 4, 0x1111_2222);
+        assert_eq!(g.read(0x70_0000 + 8, 4), 0x1111_2222);
+        shared.set_ramin_base(0x30_0000);
+        // the private copy is gone: the window now shows what is in RAM there
+        assert_eq!(g.read(0x70_0000 + 8, 4), 0);
+        ram.write(0x30_0008, &0xDEAD_BEEFu32.to_le_bytes());
+        assert_eq!(g.read(0x70_0000 + 8, 4), 0xDEAD_BEEF);
+        g.write(0x70_0000 + 0x10, 4, 0xCAFE_F00D);
+        assert_eq!(ram.read_u32(0x30_0010), Some(0xCAFE_F00D));
     }
 
     fn put_ramin(g: &mut Nv2a, at: u64, v: u32) {

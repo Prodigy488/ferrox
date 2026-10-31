@@ -403,7 +403,8 @@ impl KernelHle {
         for src in &mut self.irq_sources {
             // handlers get at least half a millisecond between runs: a handler that fails to
             // silence its device would otherwise never let the game continue
-            if (src.last_fire != u64::MAX && now < src.last_fire + 5_000) || !(src.line)(now) {
+            let asserted = (src.line)(now);
+            if !asserted || (src.last_fire != u64::MAX && now < src.last_fire + 5_000) {
                 continue;
             }
             let hit = self.sched.interrupts.iter().find(|(_, i)| i.connected && i.vector == src.vector);

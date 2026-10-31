@@ -39,6 +39,8 @@ pub struct Shared {
     /// PMC_INTR_EN_0 (bit 0: hardware interrupts on), PCRTC_INTR_0 (bit 0: vertical blank
     /// happened) and PCRTC_INTR_EN_0, shared so the host can raise the interrupt line.
     pmc_intr_en: AtomicU32,
+    /// Where instance memory sits in system RAM once the kernel has claimed it (0 = not yet).
+    ramin_base: AtomicU32,
     pcrtc_intr: AtomicU32,
     pcrtc_intr_en: AtomicU32,
     unhandled: Mutex<BTreeMap<(bool, u32), u32>>,
@@ -50,6 +52,16 @@ pub struct Shared {
 }
 
 impl Shared {
+    /// Points instance memory at `base` in system RAM: from now on the game's own writes to that
+    /// memory and the chip's view of it (through the PRAMIN window) are the same bytes.
+    pub fn set_ramin_base(&self, base: u32) {
+        self.ramin_base.store(base, Ordering::Relaxed);
+    }
+
+    pub(crate) fn ramin_base(&self) -> u32 {
+        self.ramin_base.load(Ordering::Relaxed)
+    }
+
     /// The picture finished: sets the vertical-blank flag the driver's interrupt handler reads.
     pub fn vblank(&self) {
         self.pcrtc_intr.fetch_or(1, Ordering::Relaxed);
