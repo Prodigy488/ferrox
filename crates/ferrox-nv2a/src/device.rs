@@ -45,6 +45,10 @@ pub struct Shared {
     pcrtc_intr: AtomicU32,
     pcrtc_intr_en: AtomicU32,
     unhandled: Mutex<BTreeMap<(bool, u32), u32>>,
+    /// The latest register accesses (is_write, offset, value), for finding what a stuck game waits on.
+    recent: Mutex<std::collections::VecDeque<(bool, u32, u32)>>,
+    /// How often each register was touched.
+    hot: Mutex<BTreeMap<(bool, u32), u64>>,
     gaps: Mutex<BTreeMap<String, u32>>,
     log: Mutex<Vec<String>>,
     methods: AtomicU64,
@@ -84,6 +88,29 @@ impl Shared {
             0 => None,
             v => Some(v),
         }
+    }
+
+    pub(crate) fn trace(&self, write: bool, offset: u64, value: u32) {
+        let mut r = self.recent.lock().unwrap();
+        if r.len() >= 48 {
+            r.pop_front();
+        }
+        r.push_back((write, offset as u32, value));
+        drop(r);
+        *self.hot.lock().unwrap().entry((write, offset as u32)).or_insert(0) += 1;
+    }
+
+    /// The most recent register accesses, oldest first: (is_write, offset, value).
+    pub fn recent_accesses(&self) -> Vec<(bool, u32, u32)> {
+        self.recent.lock().unwrap().iter().copied().collect()
+    }
+
+    /// The `n` most-touched registers: (is_write, offset, count).
+    pub fn hottest(&self, n: usize) -> Vec<(bool, u32, u64)> {
+        let mut v: Vec<_> = self.hot.lock().unwrap().iter().map(|(&(w, o), &c)| (w, o, c)).collect();
+        v.sort_by_key(|&(_, _, c)| std::cmp::Reverse(c));
+        v.truncate(n);
+        v
     }
 
     /// Registers touched but not emulated: (is_write, offset, count).
@@ -195,6 +222,23 @@ const USER: u64 = 0x80_0000;
 
 impl Mmio for Nv2a {
     fn read(&mut self, offset: u64, size: usize) -> u64 {
+        let v = self.read_inner(offset, size);
+        if !(PRAMIN..USER).contains(&offset) {
+            self.shared.trace(false, offset, v as u32);
+        }
+        v
+    }
+
+    fn write(&mut self, offset: u64, size: usize, value: u64) {
+        if !(PRAMIN..USER).contains(&offset) {
+            self.shared.trace(true, offset, value as u32);
+        }
+        self.write_inner(offset, size, value);
+    }
+}
+
+impl Nv2a {
+    fn read_inner(&mut self, offset: u64, size: usize) -> u64 {
         if (PRAMIN..USER).contains(&offset) {
             return self.gpu.ramin_read(offset - PRAMIN, size);
         }
@@ -234,7 +278,7 @@ impl Mmio for Nv2a {
         }
     }
 
-    fn write(&mut self, offset: u64, size: usize, value: u64) {
+    fn write_inner(&mut self, offset: u64, size: usize, value: u64) {
         let v = value as u32;
         if (PRAMIN..USER).contains(&offset) {
             return self.gpu.ramin_write(offset - PRAMIN, size, value);

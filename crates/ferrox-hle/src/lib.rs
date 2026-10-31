@@ -189,6 +189,8 @@ pub struct KernelHle {
     counts: HashMap<u32, u64>,
     /// Calls to exports with no handler (only filled in lenient mode).
     missing: HashMap<u32, u64>,
+    /// Interrupt handlers started so far.
+    pub delivered: u64,
 }
 
 /// Where the loaded image starts running, and what the loader did.
@@ -413,6 +415,7 @@ impl KernelHle {
                 continue;
             }
             src.last_fire = now;
+            self.delivered += 1;
             self.sched.inject_call(bus, regs, i.routine, &[obj, i.context], i.irql);
             return true;
         }

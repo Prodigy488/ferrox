@@ -536,8 +536,16 @@ fn put64(c: &mut Call, at: u32, v: u64) {
 fn object_name(c: &mut Call, oa: u32) -> (u32, String) {
     let root = c.read_u32(oa).unwrap_or(0);
     let name = c.read_u32(oa + 4).unwrap_or(0);
-    (root, ansi(c, name))
+    let name = ansi(c, name);
+    // the system's own handle for the drive-letter directory (\??): "z:\\dir" is relative to it
+    if root == OB_DOS_DEVICES {
+        return (0, format!("\\??\\{name}"));
+    }
+    (root, name)
 }
+
+/// What the kernel's `ObDosDevicesDirectory` stands for as a root-directory handle.
+const OB_DOS_DEVICES: u32 = 0xFFFF_FFFD;
 
 fn signal(c: &mut Call, event: u32) {
     if event != 0 {

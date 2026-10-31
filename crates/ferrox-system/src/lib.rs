@@ -535,6 +535,18 @@ pub fn run(
             ));
         }
     }
+    if cfg.probe.is_some() {
+        let hot = gpu_state.hottest(10);
+        if !hot.is_empty() {
+            let list: Vec<String> = hot.iter().map(|&(w, o, n)| format!("{} {o:#x} x{n}", if w { "write" } else { "read" })).collect();
+            say(&format!("[probe] GPU registers touched most: {}\n", list.join(", ")));
+        }
+        let recent = gpu_state.recent_accesses();
+        if !recent.is_empty() {
+            let list: Vec<String> = recent.iter().map(|&(w, o, v)| format!("{}{o:#x}={v:#x}", if w { "W" } else { "R" })).collect();
+            say(&format!("[probe] last GPU register accesses (oldest first): {}\n", list.join(" ")));
+        }
+    }
     let missed = gpu_state.unhandled();
     if !missed.is_empty() {
         let list: Vec<String> = missed
@@ -622,6 +634,13 @@ fn probe_report(
         *b = mem.read(r.eip as u64 + i as u64, 1).unwrap_or(0) as u8;
     }
     say(&format!("[probe] bytes at eip: {}\n", code.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")));
+    // the code around where the game is: enough to read a wait loop
+    let from = r.eip.saturating_sub(64);
+    let around: Vec<String> = (0..128u64)
+        .map(|i| format!("{:02x}", mem.read(from as u64 + i, 1).unwrap_or(0)))
+        .collect();
+    say(&format!("[probe] code from {from:#x}: {}\n", around.join("")));
+    say(&format!("[probe] interrupt handlers started: {}\n", hle.delivered));
     let mut stack = Vec::new();
     for i in 0..8u64 {
         stack.push(format!("{:#x}", mem.read(r.gpr[ESP] as u64 + 4 * i, 4).unwrap_or(0)));
