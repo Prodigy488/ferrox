@@ -15,6 +15,7 @@
 
 pub mod exports;
 pub mod kernel;
+pub mod io;
 pub mod ke;
 pub mod misc;
 pub mod sched;

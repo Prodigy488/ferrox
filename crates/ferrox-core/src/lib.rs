@@ -34,6 +34,20 @@ impl std::error::Error for BusError {}
 pub trait Bus {
     fn read(&mut self, addr: GuestAddr, size: usize) -> Result<u64, BusError>;
     fn write(&mut self, addr: GuestAddr, size: usize, value: u64) -> Result<(), BusError>;
+    /// Copies `buf.len()` bytes from guest memory.
+    fn read_bytes(&mut self, addr: GuestAddr, buf: &mut [u8]) -> Result<(), BusError> {
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = self.read(addr + i as u64, 1)? as u8;
+        }
+        Ok(())
+    }
+    /// Copies `data` into guest memory.
+    fn write_bytes(&mut self, addr: GuestAddr, data: &[u8]) -> Result<(), BusError> {
+        for (i, b) in data.iter().enumerate() {
+            self.write(addr + i as u64, 1, *b as u64)?;
+        }
+        Ok(())
+    }
     /// Port input. Unclaimed ports read as all ones, like an empty ISA bus.
     fn io_in(&mut self, _port: u16, size: usize) -> u64 {
         match size {

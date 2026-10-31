@@ -357,6 +357,46 @@ impl Bus for PhysMem {
         }
     }
 
+    fn read_bytes(&mut self, addr: GuestAddr, buf: &mut [u8]) -> Result<(), BusError> {
+        let mut done = 0;
+        while done < buf.len() {
+            let at = addr + done as u64;
+            let (r, off) = self.find(at, 1).ok_or(BusError::Unmapped(at))?;
+            match &mut r.backing {
+                Backing::Ram(d) => {
+                    let n = (buf.len() - done).min(d.len() - off as usize);
+                    buf[done..done + n].copy_from_slice(&d[off as usize..off as usize + n]);
+                    done += n;
+                }
+                _ => {
+                    buf[done] = self.read(at, 1)? as u8;
+                    done += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn write_bytes(&mut self, addr: GuestAddr, data: &[u8]) -> Result<(), BusError> {
+        let mut done = 0;
+        while done < data.len() {
+            let at = addr + done as u64;
+            let (r, off) = self.find(at, 1).ok_or(BusError::Unmapped(at))?;
+            match &mut r.backing {
+                Backing::Ram(d) => {
+                    let n = (data.len() - done).min(d.len() - off as usize);
+                    d[off as usize..off as usize + n].copy_from_slice(&data[done..done + n]);
+                    done += n;
+                }
+                _ => {
+                    self.write(at, 1, data[done] as u64)?;
+                    done += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn io_in(&mut self, port: u16, size: usize) -> u64 {
         for (range, dev) in &mut self.ports {
             if range.contains(&port) {
@@ -491,5 +531,39 @@ mod tests {
         let mut m = PhysMem::new();
         assert_eq!(m.io_in(0x80, 1), 0xff);
         assert_eq!(m.io_in(0x80, 4), 0xffff_ffff);
+    }
+}
+
+/// A device that stands in for hardware that is not emulated yet: reads give zero, writes are
+/// dropped, and every register touched is remembered so a report can list what a game needs.
+pub struct Placeholder {
+    log: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<(bool, u32), u32>>>,
+}
+
+/// Read-side handle to a [`Placeholder`]'s record of touched registers.
+#[derive(Clone)]
+pub struct PlaceholderLog(std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<(bool, u32), u32>>>);
+
+impl Placeholder {
+    pub fn new() -> (Placeholder, PlaceholderLog) {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+        (Placeholder { log: log.clone() }, PlaceholderLog(log))
+    }
+}
+
+impl PlaceholderLog {
+    /// (was a write, register offset, times), sorted by offset.
+    pub fn touched(&self) -> Vec<(bool, u32, u32)> {
+        self.0.lock().unwrap().iter().map(|(&(w, o), &n)| (w, o, n)).collect()
+    }
+}
+
+impl Mmio for Placeholder {
+    fn read(&mut self, offset: u64, _size: usize) -> u64 {
+        *self.log.lock().unwrap().entry((false, offset as u32)).or_insert(0) += 1;
+        0
+    }
+    fn write(&mut self, offset: u64, _size: usize, _value: u64) {
+        *self.log.lock().unwrap().entry((true, offset as u32)).or_insert(0) += 1;
     }
 }

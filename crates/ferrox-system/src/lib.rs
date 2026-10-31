@@ -10,7 +10,7 @@ use ferrox_formats::xbe::Xbe;
 use ferrox_formats::xdvdfs::Xdvdfs;
 use ferrox_hle::kernel::{self, KernelState};
 use ferrox_hle::video::Framebuffer;
-use ferrox_hle::{KernelHle, Layout, SchedAreas};
+use ferrox_hle::{io, KernelHle, Layout, SchedAreas};
 use ferrox_machine::PhysMem;
 use std::fs::File;
 use std::io::BufReader;
@@ -30,6 +30,14 @@ const SCHED: SchedAreas = SchedAreas {
     stack_top: STACK_TOP,
     stack_size: 0x4_0000,
 };
+/// Memory-mapped chips that are not emulated yet: (name, base, size).
+const PLACEHOLDERS: [(&str, u64, u64); 5] = [
+    ("audio processor", 0xFE80_0000, 0x8_0000),
+    ("AC97 audio", 0xFEC0_0000, 0x1000),
+    ("USB 0", 0xFED0_0000, 0x1000),
+    ("USB 1", 0xFED0_8000, 0x1000),
+    ("network", 0xFEF0_0000, 0x400),
+];
 const LAYOUT: Layout = Layout { stub_base: 0x00F0_0000, data_base: 0x00F1_0000, stack_top: STACK_TOP };
 const HEAP: std::ops::Range<u32> = 0x0200_0000..0x03F0_0000;
 
@@ -181,6 +189,19 @@ impl Source {
             _ => Vec::new(),
         };
         Err(format!("{} was not found{}", p.display(), if near.is_empty() { String::new() } else { format!(" (similar names there: {})", near.join(", ")) }))
+    }
+
+    /// The files the game sees as drive `D:`.
+    pub fn disc_volume(&self) -> Option<Box<dyn io::Volume>> {
+        match self {
+            Source::Xbe(p) => Some(Box::new(io::HostVolume::new(p.parent()?.to_path_buf()))),
+            Source::Folder(p) => Some(Box::new(io::HostVolume::new(p.clone()))),
+            Source::Iso(p) => {
+                let f = File::open(p).ok()?;
+                let disc = Xdvdfs::open(BufReader::new(f)).ok()?;
+                Some(Box::new(io::DiscVolume::new(disc)))
+            }
+        }
     }
 
     pub fn read_xbe(&self) -> Result<Vec<u8>, String> {
@@ -375,8 +396,20 @@ pub fn run(
     gpu.attach_ram(mem.ram_view(0).ok_or("no memory to give the GPU")?);
     mem.add_mmio(ferrox_nv2a::device::BASE, ferrox_nv2a::device::SIZE, Box::new(gpu))
         .map_err(|e| e.to_string())?;
+    // chips that are not emulated yet answer with zeros, and are listed in the report
+    let mut placeholders: Vec<(&str, u64, ferrox_machine::PlaceholderLog)> = Vec::new();
+    for (name, base, size) in PLACEHOLDERS {
+        let (dev, log) = ferrox_machine::Placeholder::new();
+        mem.add_mmio(base, size, Box::new(dev)).map_err(|e| e.to_string())?;
+        placeholders.push((name, base, log));
+    }
     let mut hle = KernelHle::with_table();
     let state: std::rc::Rc<std::cell::RefCell<KernelState>> = kernel::install(&mut hle, HEAP);
+    let files = std::rc::Rc::new(std::cell::RefCell::new(io::Files::new(xbe.certificate.title_id)));
+    if let Some(disc) = cfg.source.disc_volume() {
+        files.borrow_mut().mount("\\Device\\CdRom0", disc);
+    }
+    io::install(&mut hle, files.clone());
     hle.set_lenient(cfg.probe.is_some());
     let loaded = hle.load(&mut mem, &xbe, &file, LAYOUT).map_err(|e| e.to_string())?;
     hle.start_scheduler(&mut mem, SCHED).map_err(|e| e.to_string())?;
@@ -456,6 +489,28 @@ pub fn run(
     show(&mut mem, true);
     if cfg.probe.is_some() {
         probe_report(&say, &xbe, &file, &hle, &outcome, started.elapsed(), cpu.as_mut(), &mut mem);
+        let opens = files.borrow().recent();
+        if !opens.is_empty() {
+            say(&format!("[probe] file operations (last {}; {} bytes read from files in total):\n", opens.len(), files.borrow().bytes_read));
+            for o in opens {
+                say(&format!("[probe]   {o}\n"));
+            }
+        }
+    }
+    for (name, base, log) in &placeholders {
+        let t = log.touched();
+        if !t.is_empty() {
+            let list: Vec<String> = t
+                .iter()
+                .take(16)
+                .map(|&(w, o, n)| format!("{} {o:#x} x{n}", if w { "write" } else { "read" }))
+                .collect();
+            say(&format!(
+                "[ferrox] the {name} chip ({base:#x}) is not emulated yet; the game touched: {}{}\n",
+                list.join(", "),
+                if t.len() > 16 { ", ..." } else { "" }
+            ));
+        }
     }
     let missed = gpu_state.unhandled();
     if !missed.is_empty() {

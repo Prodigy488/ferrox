@@ -442,6 +442,41 @@ pub fn install(hle: &mut KernelHle, st: Rc<RefCell<KernelState>>) {
         0
     });
 
+    // ---- RC4: the context is 256 state bytes, then the two indices ----
+    hle.handle("XcRC4Key", |c| {
+        let (ctx, n, key) = (arg(c, 0), arg(c, 1), arg(c, 2));
+        let mut k = vec![0u8; n as usize];
+        let _ = c.bus.read_bytes(key as u64, &mut k);
+        let mut sbox: Vec<u8> = (0..=255).collect();
+        let mut j = 0u8;
+        for i in 0..256 {
+            j = j.wrapping_add(sbox[i]).wrapping_add(if k.is_empty() { 0 } else { k[i % k.len()] });
+            sbox.swap(i, j as usize);
+        }
+        let _ = c.bus.write_bytes(ctx as u64, &sbox);
+        let _ = c.bus.write_bytes(ctx as u64 + 256, &[0, 0]);
+        0
+    });
+    hle.handle("XcRC4Crypt", |c| {
+        let (ctx, n, data) = (arg(c, 0), arg(c, 1), arg(c, 2));
+        let mut st = vec![0u8; 258];
+        let _ = c.bus.read_bytes(ctx as u64, &mut st);
+        let mut buf = vec![0u8; n as usize];
+        let _ = c.bus.read_bytes(data as u64, &mut buf);
+        let (mut i, mut j) = (st[256], st[257]);
+        for b in buf.iter_mut() {
+            i = i.wrapping_add(1);
+            j = j.wrapping_add(st[i as usize]);
+            st.swap(i as usize, j as usize);
+            *b ^= st[st[i as usize].wrapping_add(st[j as usize]) as usize];
+        }
+        st[256] = i;
+        st[257] = j;
+        let _ = c.bus.write_bytes(ctx as u64, &st);
+        let _ = c.bus.write_bytes(data as u64, &buf);
+        0
+    });
+
     // ---- SHA-1 ----
     hle.handle("XcSHAInit", |c| {
         let ctx = arg(c, 0);
