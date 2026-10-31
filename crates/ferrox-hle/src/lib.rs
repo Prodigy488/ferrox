@@ -528,7 +528,9 @@ impl KernelHle {
                         }
                         self.after_call(&mut regs, bus)?;
                         cpu.set_regs(regs);
-                        budget = budget.saturating_sub(1);
+                        // a millisecond of sleeping is worth a good share of the budget, so a
+                        // caller that checks its own deadline between runs gets the CPU back
+                        budget = budget.saturating_sub(5_000);
                         continue;
                     }
                     if ordinal == ORD_THREAD_END || ordinal == ORD_INJECT_RETURN {
