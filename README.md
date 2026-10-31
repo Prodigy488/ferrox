@@ -13,6 +13,7 @@ is the groundwork that everything else sits on, with tests:
 | `ferrox-formats` | XDVDFS (XISO) disc reader, XBE executable parser | working, tested; XDVDFS also checked against an image made by `extract-xiso` |
 | `ferrox-machine` | Physical address space: RAM, mirrored BIOS ROM, MMIO and port devices | working, tested |
 | `ferrox-cpu` | CPU backend interface + a tiny reference interpreter for tests | interface done; **no real CPU backend yet** |
+| `ferrox-hle` | High-level kernel mode: loads an XBE, stubs the kernel imports, serves calls from the host | working on the reference interpreter; export table intentionally empty |
 | `ferrox-nv2a` | GPU command-stream (pushbuffer) decoder | working, tested against xemu's `pfifo.c` rules |
 | `ferrox-cli` | `ferrox info`, `ferrox ls`, `ferrox pushbuffer` | working |
 

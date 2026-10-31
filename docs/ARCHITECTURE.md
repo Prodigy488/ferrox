@@ -20,7 +20,7 @@ ferrox-cli / (future) ferrox-app        front ends
   machine assembly                       wires devices into a console
         |
  +------+---------+-----------+----------+
- | ferrox-machine | ferrox-nv2a | (future) apu, usb, ide, smbus, nvnet ...
+ | ferrox-machine | ferrox-nv2a | ferrox-hle | (future) apu, usb, ide, smbus, nvnet ...
  +----------------+-------------+
         |
    ferrox-cpu  <--  backends: KVM, WHPX, HVF, reference interpreter
@@ -40,6 +40,16 @@ ferrox-cli / (future) ferrox-app        front ends
   generation, the renderer) can be built and tested against a recorded stream.
 * `ferrox-formats` reads discs and executables with every field bounds-checked;
   hostile files produce errors, never panics.
+
+## Two modes, one machine
+
+* **Hardware mode:** boot ROM and BIOS run on the emulated chipset (you supply them).
+* **High-level kernel mode:** `ferrox-hle` loads the XBE directly and answers kernel
+  calls on the host. See LANDSCAPE.md for why both exist.
+
+The guest leaves the VM for a kernel call with `out 0xE0, eax` (`HLE_PORT`, ordinal in
+`eax`). The host reads stdcall arguments from the guest stack, writes the result to
+`eax`, and the stub's `ret 4*n` cleans up.
 
 ## Hardware-virtualized CPU: the main design risk
 
@@ -61,7 +71,7 @@ PC. Known hazards, each with a plan:
 
 ## Testing strategy
 
-* Unit tests per crate (23 now). Parsers get truncation and corruption tests.
+* Unit tests per crate (30 now). Parsers get truncation and corruption tests.
 * Differential testing: use xemu as an oracle. Feed the same pushbuffer to both and
   compare register state or rendered frames.
 * Golden traces: record real games once, replay without the CPU.

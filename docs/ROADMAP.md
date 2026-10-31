@@ -8,11 +8,18 @@ easiest. Each milestone ends with something you can run.
 Disc and executable readers, physical memory map, CPU backend interface, pushbuffer
 decoder, CLI, tests.
 
+## M0.5 — High-level kernel groundwork (done)
+`ferrox-hle`: XBE loader, kernel-import stubs, host-side export registry, run loop,
+tested end to end on the reference interpreter with a synthetic executable.
+Exports are registered as needed; none of the real table is claimed yet.
+
 ## M1 — Run guest code
 * A real CPU backend: KVM first (Linux), then WHPX and HVF.
 * PCI configuration space, PIC/PIT, enough chipset to execute the MCPX boot ROM
   to the point where it reads the BIOS.
 * Milestone check: the boot ROM runs and decrypts the BIOS (you supply both).
+* In parallel, HLE mode on the same backend: a homebrew XBE runs with no BIOS and
+  its first kernel calls (memory, threads, debug output) are served by `ferrox-hle`.
 
 ## M2 — Boot the BIOS
 * SMBus, SMC and EEPROM, IDE with the XISO reader as the disc, flash ROM.

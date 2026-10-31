@@ -26,6 +26,16 @@ name = "ferrox-formats"
 version = "0.1.0"
 
 [[package]]
+name = "ferrox-hle"
+version = "0.1.0"
+dependencies = [
+ "ferrox-core",
+ "ferrox-cpu",
+ "ferrox-formats",
+ "ferrox-machine",
+]
+
+[[package]]
 name = "ferrox-machine"
 version = "0.1.0"
 dependencies = [

@@ -18,6 +18,7 @@ pub struct Regs {
 pub const EAX: usize = 0;
 pub const ECX: usize = 1;
 pub const EDX: usize = 2;
+pub const ESP: usize = 4;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Exit {
@@ -25,7 +26,16 @@ pub enum Exit {
     Halt,
     /// The instruction budget ran out.
     Budget,
+    /// The guest wrote `HLE_PORT`: it is calling into the emulator (the
+    /// high-level kernel). Carries the 32-bit value written (the export
+    /// ordinal). Execution resumes after the `out` when `run` is called again.
+    Hypercall(u32),
 }
+
+/// The I/O port the kernel stubs write to in order to call into the host.
+/// Every hypervisor reports a port write to userspace, so real backends can
+/// raise `Exit::Hypercall` from that exit without any special instruction.
+pub const HLE_PORT: u16 = 0xE0;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum CpuError {
@@ -62,7 +72,8 @@ pub trait CpuBackend {
 }
 
 /// The test interpreter: nop, mov r32 imm32, mov eax/[abs32], inc/dec r32,
-/// add eax imm32, jmp/jne rel8, in/out (imm8 and dx forms, 8-bit), hlt.
+/// add eax imm32, jmp/jne rel8, push imm32, call [abs32], ret / ret imm16,
+/// in/out (8-bit imm8 and dx forms; `out imm8, eax` for the hypercall port), hlt.
 #[derive(Default)]
 pub struct RefCpu {
     regs: Regs,
@@ -82,6 +93,18 @@ impl RefCpu {
     fn fetch32(&mut self, bus: &mut dyn Bus) -> Result<u32, CpuError> {
         let v = bus.read(self.regs.eip as u64, 4)? as u32;
         self.regs.eip = self.regs.eip.wrapping_add(4);
+        Ok(v)
+    }
+
+    fn push(&mut self, bus: &mut dyn Bus, v: u32) -> Result<(), CpuError> {
+        self.regs.gpr[ESP] = self.regs.gpr[ESP].wrapping_sub(4);
+        bus.write(self.regs.gpr[ESP] as u64, 4, v as u64)?;
+        Ok(())
+    }
+
+    fn pop(&mut self, bus: &mut dyn Bus) -> Result<u32, CpuError> {
+        let v = bus.read(self.regs.gpr[ESP] as u64, 4)? as u32;
+        self.regs.gpr[ESP] = self.regs.gpr[ESP].wrapping_add(4);
         Ok(v)
     }
 
@@ -157,6 +180,41 @@ impl CpuBackend for RefCpu {
                 0xEE => {
                     let p = self.regs.gpr[EDX] as u16;
                     bus.io_out(p, 1, (self.regs.gpr[EAX] & 0xff) as u64);
+                }
+                0x68 => {
+                    let v = self.fetch32(bus)?;
+                    self.push(bus, v)?;
+                }
+                0xFF => {
+                    // only `call [abs32]` (ModRM 0x15)
+                    let modrm = self.fetch8(bus)?;
+                    if modrm != 0x15 {
+                        return Err(CpuError::Unimplemented { eip: at, opcode: op });
+                    }
+                    let a = self.fetch32(bus)?;
+                    let target = bus.read(a as u64, 4)? as u32;
+                    let ret = self.regs.eip;
+                    self.push(bus, ret)?;
+                    self.regs.eip = target;
+                }
+                0xC3 | 0xC2 => {
+                    let pop = if op == 0xC2 {
+                        let lo = self.fetch8(bus)? as u32;
+                        lo | (self.fetch8(bus)? as u32) << 8
+                    } else {
+                        0
+                    };
+                    let ret = self.pop(bus)?;
+                    self.regs.gpr[ESP] = self.regs.gpr[ESP].wrapping_add(pop);
+                    self.regs.eip = ret;
+                }
+                0xE7 => {
+                    let p = self.fetch8(bus)? as u16;
+                    let v = self.regs.gpr[EAX];
+                    if p == HLE_PORT {
+                        return Ok(Exit::Hypercall(v));
+                    }
+                    bus.io_out(p, 4, v as u64);
                 }
                 0xF4 => return Ok(Exit::Halt),
                 _ => return Err(CpuError::Unimplemented { eip: at, opcode: op }),

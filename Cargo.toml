@@ -6,6 +6,7 @@ members = [
     "crates/ferrox-machine",
     "crates/ferrox-cpu",
     "crates/ferrox-nv2a",
+    "crates/ferrox-hle",
     "crates/ferrox-cli",
 ]
 

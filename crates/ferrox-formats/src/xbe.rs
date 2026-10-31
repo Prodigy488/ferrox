@@ -187,14 +187,16 @@ impl Xbe {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
 
-    const BASE: u32 = 0x0001_0000;
+/// Builds small, valid XBE files for tests (here and in other crates). Not
+/// part of the stable API.
+#[doc(hidden)]
+pub mod synth {
+    use super::*;
+    pub const BASE: u32 = 0x0001_0000;
 
     /// A minimal two-section XBE: .text at 0x11000 and a thunk table in .rdata.
-    fn build(retail: bool, ordinals: &[u32]) -> Vec<u8> {
+    pub fn build(retail: bool, ordinals: &[u32]) -> Vec<u8> {
         let mut h = vec![0u8; 0x1000];
         h[..4].copy_from_slice(b"XBEH");
         let put = |h: &mut Vec<u8>, at: usize, v: u32| h[at..at + 4].copy_from_slice(&v.to_le_bytes());
@@ -243,6 +245,14 @@ mod tests {
         }
         file
     }
+
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use super::synth::{build, BASE};
 
     #[test]
     fn parses_retail_and_debug_images() {
