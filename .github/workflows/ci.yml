@@ -1,0 +1,33 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Linux system libraries for the GUI
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev libgl1-mesa-dev
+      - name: Test
+        run: cargo test --workspace
+      - name: Build release binaries
+        run: cargo build --release -p ferrox-app -p ferrox-cli
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ferrox-${{ runner.os }}
+          path: |
+            target/release/ferrox
+            target/release/ferrox.exe
+            target/release/ferrox-gui
+            target/release/ferrox-gui.exe
+          if-no-files-found: ignore
