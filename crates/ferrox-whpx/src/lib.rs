@@ -238,7 +238,7 @@ impl WhpCpu {
                 if w.ticks.fetch_add(1, Ordering::Relaxed) + 1 >= w.slice_ticks.load(Ordering::Relaxed) {
                     w.ticks.store(0, Ordering::Relaxed);
                     // SAFETY: cancelling a run is allowed from another thread.
-                    unsafe { (a.cancel_run)(P(handle), 0, 0) };
+                    unsafe { (a.cancel_run)(WHV_PARTITION_HANDLE(handle), 0, 0) };
                 }
             }
         });
