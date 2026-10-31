@@ -10,7 +10,7 @@
 use crate::combiner::Combiner;
 use crate::device::Shared;
 use crate::raster::{self, Depth, Surface, Vertex};
-use crate::texture::{self, Address, Texture};
+use crate::texture::{self, Address, Mip, Texture};
 use crate::vsh::{self, Program};
 use crate::{decode, Command};
 use ferrox_machine::RamView;
@@ -680,6 +680,10 @@ impl Gpu {
             wrap_u: Address::from_field(addr & 7),
             wrap_v: Address::from_field((addr >> 8) & 7),
             bilinear: mag == 2 || mag == 4,
+            min_linear: matches!(min, 2 | 4 | 6 | 7),
+            mip: Mip::Off, // level selection is wired up with the per-pixel level of detail
+            levels: 1,
+            lod_bias: 0.0,
             border: {
                 let c = base(0x24);
                 [(c >> 16 & 0xFF) as f32 / 255.0, (c >> 8 & 0xFF) as f32 / 255.0, (c & 0xFF) as f32 / 255.0, (c >> 24) as f32 / 255.0]

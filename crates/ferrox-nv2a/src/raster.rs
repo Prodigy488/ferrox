@@ -628,7 +628,8 @@ mod tests {
         ram.write_u32(0x2004, 0xFFFF_0000);
         let t = Texture {
             ram, addr: 0x2000, format: FMT_LU_A8R8G8B8, width: 2, height: 1, pitch: 8,
-            wrap_u: Address::Clamp, wrap_v: Address::Clamp, bilinear: false, border: [0.0; 4],
+            wrap_u: Address::Clamp, wrap_v: Address::Clamp, bilinear: false, min_linear: false,
+            mip: crate::texture::Mip::Off, levels: 1, lod_bias: 0.0, border: [0.0; 4],
         };
         let mk = |x: f32, y: f32, s: f32, t: f32| Vertex { x, y, z: 0.0, w: 1.0, color: [0.0, 0.5, 1.0, 1.0], spec: [0.0; 4], tex: [s, t, 0.0, 1.0] };
         // coordinates in texels: 0 at the left edge to 2 at the right (linear textures)

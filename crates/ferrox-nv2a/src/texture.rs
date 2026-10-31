@@ -84,8 +84,28 @@ pub struct Texture {
     pub pitch: u32,
     pub wrap_u: Address,
     pub wrap_v: Address,
+    /// Linear filtering when the texture is magnified.
     pub bilinear: bool,
+    /// Linear filtering inside a level when the texture is minified.
+    pub min_linear: bool,
+    /// How levels are chosen when minifying.
+    pub mip: Mip,
+    /// Number of levels stored (1 = no mipmaps).
+    pub levels: u32,
+    /// Added to the computed level of detail.
+    pub lod_bias: f32,
     pub border: [f32; 4],
+}
+
+/// How the level of detail picks mipmap levels.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Mip {
+    /// Always level 0.
+    Off,
+    /// The nearest level.
+    Nearest,
+    /// Blend the two nearest levels (trilinear).
+    Linear,
 }
 
 /// Spreads the low bits of `v` into the positions set in `mask`.
@@ -268,6 +288,27 @@ impl Texture {
         }
     }
 
+    /// Bytes one level occupies (swizzled and block layouts store levels one after another).
+    fn level_bytes(&self, w: u32, h: u32) -> u64 {
+        let Some((layout, bpt)) = describe(self.format) else { return 0 };
+        match layout {
+            Layout::Blocks => (w.div_ceil(4).max(1) as u64) * (h.div_ceil(4).max(1) as u64) * bpt as u64,
+            _ => w as u64 * h as u64 * bpt as u64,
+        }
+    }
+
+    /// Mipmap level `l` as a texture of its own (level 0 is `self`).
+    pub fn level(&self, l: u32) -> Texture {
+        let mut addr = self.addr;
+        let (mut w, mut h) = (self.width, self.height);
+        for _ in 0..l {
+            addr += self.level_bytes(w, h);
+            w = (w / 2).max(1);
+            h = (h / 2).max(1);
+        }
+        Texture { addr, width: w, height: h, levels: 1, mip: Mip::Off, ..*self }
+    }
+
     pub fn is_linear_layout(&self) -> bool {
         describe(self.format).map(|d| d.0) == Some(Layout::Linear)
     }
@@ -275,8 +316,49 @@ impl Texture {
     /// Samples at (s, t): normalised 0..1 for swizzled and block textures,
     /// in texels for linear ones (as the hardware does).
     pub fn sample(&self, s: f32, t: f32) -> [f32; 4] {
+        self.filter(s, t, self.bilinear)
+    }
+
+    /// The level of detail for a pixel whose coordinates move by (dsdx, dtdx) per pixel in x and
+    /// (dsdy, dtdy) per pixel in y (in the same units `sample` takes).
+    pub fn lod(&self, dsdx: f32, dtdx: f32, dsdy: f32, dtdy: f32) -> f32 {
+        let (sx, sy) = if self.is_linear_layout() { (1.0, 1.0) } else { (self.width as f32, self.height as f32) };
+        let len = |a: f32, b: f32| ((a * sx).powi(2) + (b * sy).powi(2)).sqrt();
+        let rho = len(dsdx, dtdx).max(len(dsdy, dtdy));
+        if rho > 0.0 { rho.log2() + self.lod_bias } else { f32::NEG_INFINITY }
+    }
+
+    /// Samples with mipmapping: `lod` as from `lod()`. Magnification (lod <= 0) uses the
+    /// magnification filter on level 0.
+    pub fn sample_lod(&self, s: f32, t: f32, lod: f32) -> [f32; 4] {
+        if lod <= 0.0 || self.levels <= 1 && !lod.is_nan() && lod <= 0.0 {
+            return self.sample(s, t);
+        }
+        let top = (self.levels.max(1) - 1) as f32;
+        let d = lod.min(top).max(0.0);
+        let lin = self.min_linear;
+        match self.mip {
+            Mip::Off => self.filter(s, t, lin),
+            Mip::Nearest => self.level((d + 0.5).floor() as u32).filter(s, t, lin),
+            Mip::Linear => {
+                let (a, f) = (d.floor(), d.fract());
+                let first = self.level(a as u32).filter(s, t, lin);
+                if f == 0.0 || a + 1.0 > top {
+                    return first;
+                }
+                let second = self.level(a as u32 + 1).filter(s, t, lin);
+                let mut out = [0.0; 4];
+                for k in 0..4 {
+                    out[k] = first[k] + (second[k] - first[k]) * f;
+                }
+                out
+            }
+        }
+    }
+
+    fn filter(&self, s: f32, t: f32, bilinear: bool) -> [f32; 4] {
         let (u, v) = if self.is_linear_layout() { (s, t) } else { (s * self.width as f32, t * self.height as f32) };
-        if !self.bilinear {
+        if !bilinear {
             return self.fetch(u.floor() as i32, v.floor() as i32);
         }
         let (u, v) = (u - 0.5, v - 0.5);
@@ -318,6 +400,10 @@ mod tests {
             wrap_u: Address::Wrap,
             wrap_v: Address::Wrap,
             bilinear: false,
+            min_linear: false,
+            mip: Mip::Off,
+            levels: 1,
+            lod_bias: 0.0,
             border: [0.0, 1.0, 0.0, 1.0],
         }
     }
