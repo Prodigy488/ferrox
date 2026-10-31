@@ -28,6 +28,14 @@ use windows::Win32::Foundation::HMODULE;
 use windows::Win32::System::Hypervisor::*;
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 
+/// Prints progress to stderr when `FERROX_TRACE` is set, so a crash inside the
+/// hypervisor setup can be located from the last line printed.
+fn trace(msg: &str) {
+    if std::env::var_os("FERROX_TRACE").is_some() {
+        eprintln!("[whpx] {msg}");
+    }
+}
+
 pub const CODE_SEL: u16 = 0x08;
 pub const DATA_SEL: u16 = 0x10;
 
@@ -78,7 +86,12 @@ fn load_api() -> Option<Api> {
 
 /// Is the Windows Hypervisor Platform installed, enabled and running?
 pub fn available() -> bool {
-    let Some(api) = load_api() else { return false };
+    trace("loading WinHvPlatform.dll");
+    let Some(api) = load_api() else {
+        trace("WinHvPlatform.dll or one of its functions is missing");
+        return false;
+    };
+    trace("asking whether the hypervisor is present");
     let mut cap = WHV_CAPABILITY::default();
     // SAFETY: cap is a valid out buffer of the size we pass.
     let hr = unsafe {
@@ -90,7 +103,9 @@ pub fn available() -> bool {
         )
     };
     // SAFETY: HypervisorPresent is the field this capability code fills in.
-    hr.is_ok() && unsafe { cap.HypervisorPresent.as_bool() }
+    let present = hr.is_ok() && unsafe { cap.HypervisorPresent.as_bool() };
+    trace(&format!("capability result {hr:?}, present = {present}"));
+    present
 }
 
 /// Same three-entry GDT as the KVM backend (null, flat code, flat data).
@@ -160,8 +175,10 @@ impl WhpCpu {
         let api = Arc::new(load_api().ok_or_else(|| {
             WhpError("not installed (turn on the 'Windows Hypervisor Platform' optional feature and restart)".into())
         })?);
+        trace("creating partition");
         let mut part = P::default();
         check((api.create_partition)(&mut part), "create partition")?;
+        trace("partition created");
         let this_fail = |api: &Api, part: P, e: WhpError| {
             (api.delete_partition)(part);
             e
@@ -178,10 +195,12 @@ impl WhpCpu {
         ) {
             return Err(this_fail(&api, part, e));
         }
+        trace("setting up partition");
         if let Err(e) = check((api.setup_partition)(part), "set up partition") {
             return Err(this_fail(&api, part, e));
         }
         for s in slots {
+            trace(&format!("mapping {:#x}+{:#x}", s.guest_addr, s.size));
             if s.guest_addr % 4096 != 0 || s.size % 4096 != 0 || s.host_ptr as usize % 4096 != 0 {
                 return Err(this_fail(&api, part, WhpError(format!("memory region {:#x}+{:#x} is not page aligned", s.guest_addr, s.size))));
             }
@@ -194,6 +213,7 @@ impl WhpCpu {
                 return Err(this_fail(&api, part, e));
             }
         }
+        trace("creating virtual processor");
         if let Err(e) = check((api.create_vp)(part, 0, 0), "create virtual processor") {
             return Err(this_fail(&api, part, e));
         }
@@ -215,6 +235,7 @@ impl WhpCpu {
             r64(entry as u64),
             r64(2),
         ];
+        trace("setting initial registers");
         if let Err(e) = check(
             (api.set_regs)(part, 0, names.as_ptr(), names.len() as u32, values.as_ptr()),
             "set initial registers",
@@ -242,6 +263,7 @@ impl WhpCpu {
                 }
             }
         });
+        trace("ready");
         Ok(Self { api, part, wd, thread: Some(thread) })
     }
 
@@ -322,6 +344,7 @@ impl CpuBackend for WhpCpu {
     /// `max_instructions` is ignored: hardware virtualization cannot count them.
     fn run(&mut self, bus: &mut dyn Bus, _max_instructions: u64) -> Result<Exit, CpuError> {
         loop {
+            trace("running guest");
             let mut ctx = WHV_RUN_VP_EXIT_CONTEXT::default();
             self.wd.ticks.store(0, Ordering::Relaxed);
             self.wd.running.store(true, Ordering::Release);
@@ -339,6 +362,7 @@ impl CpuBackend for WhpCpu {
                 return Err(cpu_err(format!("WHvRunVirtualProcessor failed ({hr:?})")));
             }
             let reason = ctx.ExitReason;
+            trace(&format!("guest exited, reason {:#x}", reason.0));
             if reason == WHvRunVpExitReasonX64IoPortAccess {
                 // SAFETY: the exit reason says this union member is the valid one.
                 let io = unsafe { ctx.Anonymous.IoPortAccess };

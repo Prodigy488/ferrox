@@ -23,6 +23,12 @@ const STACK_TOP: u32 = 0x00E0_0000 - 16;
 const LAYOUT: Layout = Layout { stub_base: 0x00F0_0000, data_base: 0x00F1_0000, stack_top: STACK_TOP };
 const HEAP: std::ops::Range<u32> = 0x0200_0000..0x03F0_0000;
 
+fn trace(msg: &str) {
+    if std::env::var_os("FERROX_TRACE").is_some() {
+        eprintln!("[system] {msg}");
+    }
+}
+
 /// One picture, ready to show: RGBA8, `width * height * 4` bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Frame {
@@ -280,7 +286,9 @@ pub fn run(
     let state: std::rc::Rc<std::cell::RefCell<KernelState>> = kernel::install(&mut hle, HEAP);
     let loaded = hle.load(&mut mem, &xbe, &file, LAYOUT).map_err(|e| e.to_string())?;
 
+    trace("image loaded, creating the CPU backend");
     let mut cpu = make_backend(cfg.backend, &mut mem, loaded.entry)?;
+    trace("CPU backend created");
     let mut r = cpu.regs();
     r.gpr[ESP] = loaded.stack_top;
     r.eip = loaded.entry;
