@@ -55,19 +55,29 @@ jobs:
           path: win
       - name: Package and publish to the builds branch
         run: |
-          sha=$(echo "$GITHUB_SHA" | cut -c1-7)
-          dir="ferrox-windows-$sha"
-          mkdir "$dir"
-          cp win/ferrox.exe win/ferrox-gui.exe "$dir/"
-          sed 's/$/\r/' packaging/windows/run-tests.bat > "$dir/run-tests.bat"
-          sed 's/$/\r/' packaging/windows/README.txt > "$dir/README.txt"
-          zip -qr "ferrox-windows-$sha.zip" "$dir"
-          git config user.name "ferrox-ci"
-          git config user.email "ci@users.noreply.github.com"
-          git checkout --orphan builds
-          git rm -rf -q . || true
-          cp "ferrox-windows-$sha.zip" .
-          echo "Latest Windows test build: ferrox-windows-$sha.zip" > README.md
-          git add "ferrox-windows-$sha.zip" README.md
-          git commit -q -m "Windows test build $sha"
-          git push -f origin builds
+          set +e
+          (
+            set -e
+            sha=$(echo "$GITHUB_SHA" | cut -c1-7)
+            dir="ferrox-windows-$sha"
+            mkdir "$dir"
+            cp win/ferrox.exe win/ferrox-gui.exe "$dir/"
+            sed 's/$/\r/' packaging/windows/run-tests.bat > "$dir/run-tests.bat"
+            sed 's/$/\r/' packaging/windows/README.txt > "$dir/README.txt"
+            zip -qr "ferrox-windows-$sha.zip" "$dir"
+            git config user.name "ferrox-ci"
+            git config user.email "ci@users.noreply.github.com"
+            git checkout --orphan builds
+            git rm -rf -q . || true
+            cp "ferrox-windows-$sha.zip" .
+            echo "Latest Windows test build: ferrox-windows-$sha.zip" > README.md
+            git add "ferrox-windows-$sha.zip" README.md
+            git commit -q -m "Windows test build $sha"
+            git push -f origin builds
+          ) > publish.log 2>&1
+          rc=$?
+          if [ $rc -ne 0 ]; then
+            msg=$(head -c 3000 publish.log | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')
+            echo "::error title=publish::$msg"
+            exit $rc
+          fi
