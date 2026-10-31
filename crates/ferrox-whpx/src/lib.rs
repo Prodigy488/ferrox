@@ -7,9 +7,9 @@
 //! restart. The library is loaded at run time, so a machine without it can still
 //! start the app; `available()` simply returns false.
 //!
-//! Limits today: memory-mapped I/O needs instruction emulation, which is not
-//! written, so a guest touching an unmapped address stops with a clear error. The
-//! no-BIOS kernel mode never does that.
+//! Memory-mapped hardware (the GPU's registers, later audio and USB) is served by
+//! Microsoft's instruction emulator in WinHvEmulation.dll, loaded on first use.
+//! String I/O instructions are not supported yet.
 //!
 //! Status: compiled in CI but **not yet run** by its author (no Windows machine
 //! was available while writing it). Treat it as untested.
@@ -140,11 +140,98 @@ struct Watchdog {
 
 const TICK: Duration = Duration::from_millis(2);
 
+/// Microsoft's instruction emulator (WinHvEmulation.dll): decodes the
+/// instruction behind a memory-mapped I/O exit and calls back to do the access.
+struct EmuApi {
+    create: unsafe extern "system" fn(*const WHV_EMULATOR_CALLBACKS, *mut *mut c_void) -> HRESULT,
+    destroy: unsafe extern "system" fn(*const c_void) -> HRESULT,
+    try_mmio: unsafe extern "system" fn(*const c_void, *const c_void, *const WHV_VP_EXIT_CONTEXT, *const WHV_MEMORY_ACCESS_CONTEXT, *mut WHV_EMULATOR_STATUS) -> HRESULT,
+}
+
+fn load_emu_api() -> Option<EmuApi> {
+    // SAFETY: as in `load_api`.
+    unsafe {
+        let lib: HMODULE = LoadLibraryW(w!("WinHvEmulation.dll")).ok()?;
+        Some(EmuApi {
+            create: std::mem::transmute(GetProcAddress(lib, s!("WHvEmulatorCreateEmulator"))?),
+            destroy: std::mem::transmute(GetProcAddress(lib, s!("WHvEmulatorDestroyEmulator"))?),
+            try_mmio: std::mem::transmute(GetProcAddress(lib, s!("WHvEmulatorTryMmioEmulation"))?),
+        })
+    }
+}
+
+/// What the emulator's callbacks need while one access is being emulated.
+struct EmuCtx {
+    api: *const Api,
+    part: P,
+    bus: *mut (dyn Bus + 'static),
+    error: Option<String>,
+}
+
+const S_OK: HRESULT = HRESULT(0);
+const E_FAIL: HRESULT = HRESULT(0x8000_4005u32 as i32);
+
+unsafe extern "system" fn cb_memory(ctx: *const c_void, info: *mut WHV_EMULATOR_MEMORY_ACCESS_INFO) -> HRESULT {
+    let c = &mut *(ctx as *mut EmuCtx);
+    let i = &mut *info;
+    let size = i.AccessSize as usize;
+    let bus = &mut *c.bus;
+    let r = if i.Direction == 0 {
+        bus.read(i.GpaAddress, size).map(|v| i.Data[..size].copy_from_slice(&v.to_le_bytes()[..size]))
+    } else {
+        let mut b = [0u8; 8];
+        b[..size].copy_from_slice(&i.Data[..size]);
+        bus.write(i.GpaAddress, size, u64::from_le_bytes(b))
+    };
+    match r {
+        Ok(()) => S_OK,
+        Err(e) => {
+            c.error = Some(e.to_string());
+            E_FAIL
+        }
+    }
+}
+
+unsafe extern "system" fn cb_io(ctx: *const c_void, info: *mut WHV_EMULATOR_IO_ACCESS_INFO) -> HRESULT {
+    let c = &mut *(ctx as *mut EmuCtx);
+    let i = &mut *info;
+    let bus = &mut *c.bus;
+    if i.Direction == 0 {
+        i.Data = bus.io_in(i.Port, i.AccessSize as usize) as u32;
+    } else {
+        bus.io_out(i.Port, i.AccessSize as usize, i.Data as u64);
+    }
+    S_OK
+}
+
+unsafe extern "system" fn cb_get_regs(ctx: *const c_void, names: *const WHV_REGISTER_NAME, count: u32, values: *mut WHV_REGISTER_VALUE) -> HRESULT {
+    let c = &*(ctx as *const EmuCtx);
+    let mut tmp = vec![Val(WHV_REGISTER_VALUE::default()); count as usize];
+    let hr = ((*c.api).get_regs)(c.part, 0, names, count, tmp.as_mut_ptr() as *mut WHV_REGISTER_VALUE);
+    std::ptr::copy_nonoverlapping(tmp.as_ptr() as *const u8, values as *mut u8, count as usize * 16);
+    hr
+}
+
+unsafe extern "system" fn cb_set_regs(ctx: *const c_void, names: *const WHV_REGISTER_NAME, count: u32, values: *const WHV_REGISTER_VALUE) -> HRESULT {
+    let c = &*(ctx as *const EmuCtx);
+    let mut tmp = vec![Val(WHV_REGISTER_VALUE::default()); count as usize];
+    std::ptr::copy_nonoverlapping(values as *const u8, tmp.as_mut_ptr() as *mut u8, count as usize * 16);
+    ((*c.api).set_regs)(c.part, 0, names, count, tmp.as_ptr() as *const WHV_REGISTER_VALUE)
+}
+
+unsafe extern "system" fn cb_translate(_: *const c_void, gva: u64, _: WHV_TRANSLATE_GVA_FLAGS, result: *mut WHV_TRANSLATE_GVA_RESULT_CODE, gpa: *mut u64) -> HRESULT {
+    // paging is off, so virtual == physical
+    *result = WHvTranslateGvaResultSuccess;
+    *gpa = gva;
+    S_OK
+}
+
 pub struct WhpCpu {
     api: Arc<Api>,
     part: P,
     wd: Arc<Watchdog>,
     thread: Option<std::thread::JoinHandle<()>>,
+    emu: Option<(EmuApi, *mut c_void)>,
 }
 
 // SAFETY: the partition handle is only used from one thread at a time (plus the
@@ -274,7 +361,7 @@ impl WhpCpu {
             }
         });
         trace("ready");
-        Ok(Self { api, part, wd, thread: Some(thread) })
+        Ok(Self { api, part, wd, thread: Some(thread), emu: None })
     }
 
     /// How long the guest may run without leaving the VM before `run` returns
@@ -282,6 +369,56 @@ impl WhpCpu {
     pub fn set_slice(&mut self, d: Duration) {
         let ticks = (d.as_millis() / TICK.as_millis()).max(1) as usize;
         self.wd.slice_ticks.store(ticks, Ordering::Relaxed);
+    }
+
+    /// Emulates the instruction behind a memory-mapped I/O exit.
+    fn emulate_mmio(
+        &mut self,
+        bus: &mut dyn Bus,
+        vp: &WHV_VP_EXIT_CONTEXT,
+        mem: &WHV_MEMORY_ACCESS_CONTEXT,
+    ) -> Result<(), CpuError> {
+        if self.emu.is_none() {
+            trace("loading WinHvEmulation.dll");
+            let api = load_emu_api().ok_or_else(|| {
+                cpu_err("WinHvEmulation.dll is missing, so memory-mapped hardware cannot be emulated")
+            })?;
+            let callbacks = WHV_EMULATOR_CALLBACKS {
+                Size: std::mem::size_of::<WHV_EMULATOR_CALLBACKS>() as u32,
+                Reserved: 0,
+                WHvEmulatorIoPortCallback: Some(cb_io),
+                WHvEmulatorMemoryCallback: Some(cb_memory),
+                WHvEmulatorGetVirtualProcessorRegisters: Some(cb_get_regs),
+                WHvEmulatorSetVirtualProcessorRegisters: Some(cb_set_regs),
+                WHvEmulatorTranslateGvaPage: Some(cb_translate),
+            };
+            let mut handle: *mut c_void = std::ptr::null_mut();
+            // SAFETY: callbacks and out pointer are valid for the call.
+            let hr = unsafe { (api.create)(&callbacks, &mut handle) };
+            if !hr.is_ok() {
+                return Err(cpu_err(format!("could not create the instruction emulator ({hr:?})")));
+            }
+            self.emu = Some((api, handle));
+        }
+        let (api, handle) = self.emu.as_ref().expect("created above");
+        // SAFETY: the bus outlives this call; the emulator only calls back during it.
+        let bus_ptr: *mut (dyn Bus + 'static) = unsafe { std::mem::transmute(bus as *mut dyn Bus) };
+        let mut ctx = EmuCtx { api: &*self.api, part: self.part, bus: bus_ptr, error: None };
+        let mut status = WHV_EMULATOR_STATUS::default();
+        // SAFETY: all pointers are valid for the call; ctx is only used by our callbacks.
+        let hr = unsafe {
+            (api.try_mmio)(*handle, &mut ctx as *mut EmuCtx as *const c_void, vp, mem, &mut status)
+        };
+        // SAFETY: AsUINT32 reads the plain bitfield word.
+        let bits = unsafe { status.AsUINT32 };
+        if !hr.is_ok() || bits & 1 == 0 {
+            let why = ctx.error.unwrap_or_else(|| format!("emulator status {bits:#x}, result {hr:?}"));
+            return Err(cpu_err(format!(
+                "access to {:#x} could not be emulated: {why}",
+                mem.Gpa
+            )));
+        }
+        Ok(())
     }
 
     fn set_one(&self, name: WHV_REGISTER_NAME, v: u64) {
@@ -296,6 +433,10 @@ impl Drop for WhpCpu {
         self.wd.quit.store(true, Ordering::Relaxed);
         if let Some(t) = self.thread.take() {
             let _ = t.join();
+        }
+        if let Some((api, handle)) = self.emu.take() {
+            // SAFETY: created by `create` above.
+            unsafe { (api.destroy)(handle) };
         }
         // SAFETY: the processor and partition were created in `new`.
         unsafe {
@@ -407,10 +548,9 @@ impl CpuBackend for WhpCpu {
                 return Ok(Exit::Budget);
             } else if reason == WHvRunVpExitReasonMemoryAccess {
                 // SAFETY: the exit reason says this union member is the valid one.
-                let gpa = unsafe { ctx.Anonymous.MemoryAccess.Gpa };
-                return Err(cpu_err(format!(
-                    "guest touched unmapped address {gpa:#x}; memory-mapped devices are not supported by this backend yet"
-                )));
+                let access = unsafe { ctx.Anonymous.MemoryAccess };
+                trace(&format!("memory-mapped access at {:#x}", access.Gpa));
+                self.emulate_mmio(bus, &ctx.VpContext, &access)?;
             } else if reason == WHvRunVpExitReasonUnrecoverableException {
                 return Err(cpu_err("guest crashed (unrecoverable exception, no IDT installed)"));
             } else {

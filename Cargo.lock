@@ -828,6 +828,9 @@ dependencies = [
 [[package]]
 name = "ferrox-nv2a"
 version = "0.1.0"
+dependencies = [
+ "ferrox-machine",
+]
 
 [[package]]
 name = "ferrox-system"
@@ -839,6 +842,7 @@ dependencies = [
  "ferrox-hle",
  "ferrox-kvm",
  "ferrox-machine",
+ "ferrox-nv2a",
  "ferrox-whpx",
 ]
 

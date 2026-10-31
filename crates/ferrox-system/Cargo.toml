@@ -12,6 +12,7 @@ ferrox-cpu = { path = "../ferrox-cpu" }
 ferrox-formats = { path = "../ferrox-formats" }
 ferrox-hle = { path = "../ferrox-hle" }
 ferrox-machine = { path = "../ferrox-machine" }
+ferrox-nv2a = { path = "../ferrox-nv2a" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ferrox-kvm = { path = "../ferrox-kvm" }

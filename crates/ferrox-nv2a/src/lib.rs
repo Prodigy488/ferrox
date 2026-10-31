@@ -9,6 +9,8 @@
 //! Decoding is a pure function of the buffer, so it can be unit tested and
 //! used for offline tools such as pushbuffer dumpers without any GPU state.
 
+pub mod device;
+
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

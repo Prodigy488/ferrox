@@ -282,6 +282,9 @@ pub fn run(
 
     let mut mem = PhysMem::new();
     mem.add_ram(0, RAM_BYTES).map_err(|e| e.to_string())?;
+    let (gpu, gpu_state) = ferrox_nv2a::device::Nv2a::new();
+    mem.add_mmio(ferrox_nv2a::device::BASE, ferrox_nv2a::device::SIZE, Box::new(gpu))
+        .map_err(|e| e.to_string())?;
     let mut hle = KernelHle::with_table();
     let state: std::rc::Rc<std::cell::RefCell<KernelState>> = kernel::install(&mut hle, HEAP);
     let loaded = hle.load(&mut mem, &xbe, &file, LAYOUT).map_err(|e| e.to_string())?;
@@ -305,7 +308,11 @@ pub fn run(
     let mut announced = false;
     let mut last_frame = std::time::Instant::now() - std::time::Duration::from_secs(1);
     let mut show = |mem: &mut PhysMem, force: bool| {
-        let Some(fb) = state.borrow().framebuffer else { return };
+        let Some(mut fb) = state.borrow().framebuffer else { return };
+        // a program that programs the CRTC directly decides where scan-out starts
+        if let Some(start) = gpu_state.display_start() {
+            fb.addr = start;
+        }
         if !announced {
             announced = true;
             say(&format!(
@@ -346,6 +353,19 @@ pub fn run(
     };
     flush(&state);
     show(&mut mem, true);
+    let missed = gpu_state.unhandled();
+    if !missed.is_empty() {
+        let list: Vec<String> = missed
+            .iter()
+            .take(12)
+            .map(|&(w, o, n)| format!("{} {o:#08x} x{n}", if w { "write" } else { "read" }))
+            .collect();
+        say(&format!(
+            "[ferrox] GPU registers touched but not emulated yet: {}{}\n",
+            list.join(", "),
+            if missed.len() > 12 { ", ..." } else { "" }
+        ));
+    }
     Ok(Report { outcome, backend, title })
 }
 
@@ -388,6 +408,16 @@ pub fn demo_xbe() -> Vec<u8> {
     c.extend([0x89, 0x07, 0x83, 0xC7, 0x04]);
     c.extend(mov(0x05, 0x0001_0203));
     c.extend([0x49, 0x75, 0xF3]);
+    // read the GPU's chip id, print it, then point scan-out at our framebuffer
+    c.push(0xA1);
+    c.extend_from_slice(&0xFD00_0000u32.to_le_bytes()); // mov eax, [PMC_BOOT_0]
+    c.push(0x50); // push eax
+    c.extend(push(BASE + 0x2080));
+    c.extend(call(0));
+    c.extend([0x83, 0xC4, 0x08]);
+    c.extend([0x89, 0xD8]); // mov eax, ebx
+    c.push(0xA3);
+    c.extend_from_slice(&0xFD60_0800u32.to_le_bytes()); // mov [PCRTC_START], eax
     c.extend(push(BASE + 0x2040));
     c.extend(call(0)); // DbgPrint(greeting)
     c.extend([0x83, 0xC4, 0x04]);
@@ -397,6 +427,8 @@ pub fn demo_xbe() -> Vec<u8> {
     let mut file = build(true, &ords);
     file[0x1000..0x1000 + c.len()].copy_from_slice(&c);
     file[0x2040..0x2040 + GREETING.len()].copy_from_slice(GREETING);
+    const GPU_FMT: &[u8] = b"gpu id: %08x\n\0";
+    file[0x2080..0x2080 + GPU_FMT.len()].copy_from_slice(GPU_FMT);
     file
 }
 
@@ -424,8 +456,10 @@ mod tests {
         let mut frames = Vec::new();
         let rep = run(&cfg, &Arc::new(AtomicBool::new(false)), |s| out.push_str(s), |f| frames.push(f)).unwrap();
         let game_out: String = out.lines().filter(|l| !l.starts_with("[ferrox]")).map(|l| format!("{l}\n")).collect();
-        assert_eq!(game_out, "hello, xbox! (test pattern drawn)\n");
+        assert_eq!(game_out, "gpu id: 02a000a3\nhello, xbox! (test pattern drawn)\n");
         assert!(out.contains("display set: 640x480"), "{out}");
+        assert!(out.contains("gpu id: 02a000a3"), "{out}");
+        assert!(!out.contains("not emulated yet"), "the demo only uses implemented registers: {out}");
         assert!(out.contains("CPU: reference"), "{out}");
         let last = frames.last().expect("the demo displays a picture");
         assert_eq!((last.width, last.height), (640, 480));
