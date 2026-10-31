@@ -20,6 +20,11 @@ pub struct Regs {
 }
 
 /// The flags a saved context carries: CF PF AF ZF SF DF OF.
+/// Diagnostics for a watchdog on another thread: how many times a hardware CPU backend has left
+/// the guest, and why the last time (reason << 32 | detail, such as a port or an address).
+pub static VM_EXITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static VM_LAST_EXIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub const FLAG_MASK: u32 = 0xCD5;
 
 pub const EAX: usize = 0;

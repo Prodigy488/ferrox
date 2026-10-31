@@ -489,7 +489,15 @@ pub fn run(
                 return;
             }
             let calls = ferrox_hle::KERNEL_CALLS.load(Ordering::Relaxed);
+            let exits = ferrox_cpu::VM_EXITS.load(Ordering::Relaxed);
             std::thread::sleep(std::time::Duration::from_secs(2));
+            let exits_now = ferrox_cpu::VM_EXITS.load(Ordering::Relaxed);
+            let last = ferrox_cpu::VM_LAST_EXIT.load(Ordering::Relaxed);
+            let phase = ferrox_hle::PHASE.load(Ordering::Relaxed);
+            println!(
+                "[probe] CPU exits in the last 2 s: {} (last: reason {:#x} at eip {:#x}); host phase {phase:#x} (1 guest running, 2<<32|n kernel call n, 3 timers and interrupts, 4 drawing the picture, 0 elsewhere)",
+                exits_now - exits, last >> 32, last as u32
+            );
             let now = ferrox_hle::KERNEL_CALLS.load(Ordering::Relaxed);
             let act = gpu.activity();
             let recent: Vec<String> = gpu
@@ -525,8 +533,10 @@ pub fn run(
         }
         match hle.run(cpu.as_mut(), &mut mem, 1_000_000) {
             Ok(Exit::Budget) => {
+                ferrox_hle::PHASE.store(4, Ordering::Relaxed);
                 flush(&state);
                 show(&mut mem, false);
+                ferrox_hle::PHASE.store(0, Ordering::Relaxed);
             }
             Ok(Exit::Halt) => {
                 let reason = state.borrow().stop_reason.clone();

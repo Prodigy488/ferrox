@@ -176,6 +176,10 @@ struct IrqSource {
 }
 
 /// Kernel calls made so far by any game in this process: a sign of life for a watchdog.
+/// Where `run` is, for a watchdog: 1 in the guest, 2 in a kernel call (detail: its ordinal),
+/// 3 in the time/interrupt/deferred-call step.
+pub static PHASE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub static KERNEL_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Default)]
@@ -497,9 +501,13 @@ impl KernelHle {
         const SLICE: u64 = 10_000;
         while budget > 0 {
             let n = budget.min(SLICE);
-            match cpu.run(bus, n).map_err(|e: CpuError| HleError::Cpu(e.to_string()))? {
+            PHASE.store(1, std::sync::atomic::Ordering::Relaxed);
+            let exit = cpu.run(bus, n);
+            PHASE.store(0, std::sync::atomic::Ordering::Relaxed);
+            match exit.map_err(|e: CpuError| HleError::Cpu(e.to_string()))? {
                 Exit::Hypercall(ordinal) => {
                     KERNEL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    PHASE.store(2 << 32 | ordinal as u64, std::sync::atomic::Ordering::Relaxed);
                     *self.counts.entry(ordinal).or_default() += 1;
                     let mut regs = cpu.regs();
                     if ordinal == ORD_THREAD_END || ordinal == ORD_INJECT_RETURN {
@@ -550,7 +558,9 @@ impl KernelHle {
                 }
                 Exit::Budget => {
                     budget -= n;
+                    PHASE.store(3, std::sync::atomic::Ordering::Relaxed);
                     self.async_events(cpu, bus);
+                    PHASE.store(0, std::sync::atomic::Ordering::Relaxed);
                 }
                 Exit::Halt => return Ok(Exit::Halt),
             }

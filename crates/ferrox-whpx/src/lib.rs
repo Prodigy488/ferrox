@@ -536,6 +536,8 @@ impl CpuBackend for WhpCpu {
                 return Err(cpu_err(format!("WHvRunVirtualProcessor failed ({hr:?})")));
             }
             let reason = ctx.ExitReason;
+            ferrox_cpu::VM_EXITS.fetch_add(1, Ordering::Relaxed);
+            ferrox_cpu::VM_LAST_EXIT.store((reason.0 as u64) << 32 | (ctx.VpContext.Rip & 0xFFFF_FFFF), Ordering::Relaxed);
             trace(&format!("guest exited, reason {:#x}", reason.0));
             if reason == WHvRunVpExitReasonX64IoPortAccess {
                 // SAFETY: the exit reason says this union member is the valid one.
