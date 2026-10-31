@@ -747,4 +747,53 @@ mod tests {
         assert_eq!(out(&mut mem, 1), 0x77, "and the interrupted code resumed");
         assert_eq!(out(&mut mem, 2), 5, "at the level the driver asked for");
     }
+
+    #[test]
+    fn a_thread_waiting_on_an_event_is_woken_by_a_timer_dpc_while_the_machine_idles() {
+        const DPC: u32 = 0x2_0400;
+        const TIMER: u32 = 0x2_0500;
+        let mut a = Asm::default();
+        a.call("KeInitializeEvent", &[EV, 0, 0]);
+        let routine_patch = a.code.len() + 6; // the routine is the second argument, pushed second
+        a.call("KeInitializeDpc", &[DPC, 0, 0]);
+        a.call("KeInitializeTimerEx", &[TIMER, 0]);
+        // due in 20 ms (-200000 x 100 ns), then every 5 ms, forever
+        a.call("KeSetTimerEx", &[TIMER, (-200_000i32) as u32, 0xFFFF_FFFF, 5, DPC]);
+        a.call("KeWaitForSingleObject", &[EV, 0, 0, 0, 0]);
+        a.store_eax(0);
+        a.raw(&[0xF4]);
+        let routine = a.here();
+        a.call("KeSetEvent", &[EV, 0, 0]);
+        a.raw(&[0xC2, 16, 0]); // (dpc, context, arg1, arg2)
+        a.code[routine_patch..routine_patch + 4].copy_from_slice(&routine.to_le_bytes());
+        let started = std::time::Instant::now();
+        let (mut mem, _, exit) = run_with(a, &[], |h| h.sched.use_real_clock());
+        assert_eq!(exit, Exit::Halt);
+        assert_eq!(out(&mut mem, 0), 0, "the wait ended normally");
+        assert!(started.elapsed().as_millis() >= 15, "the timer's time really passed");
+    }
+
+    #[test]
+    fn waiting_forever_with_nothing_that_could_wake_the_thread_is_reported() {
+        let mut a = Asm::default();
+        a.call("KeInitializeEvent", &[EV, 0, 0]);
+        a.call("KeWaitForSingleObject", &[EV, 0, 0, 0, 0]);
+        a.raw(&[0xF4]);
+        let ords: Vec<u32> = a.names.iter().map(|n| ord(n)).collect();
+        let mut file = build(true, &ords);
+        file[0x1000..0x1000 + a.code.len()].copy_from_slice(&a.code);
+        let xbe = Xbe::parse(&file).unwrap();
+        let mut hle = KernelHle::with_table();
+        kernel::install(&mut hle, 0x38_0000..0x3F_0000);
+        hle.sched.use_real_clock();
+        let mut mem = PhysMem::new();
+        mem.add_ram(0, 4 * 1024 * 1024).unwrap();
+        let loaded = hle.load(&mut mem, &xbe, &file, LAYOUT).unwrap();
+        hle.start_scheduler(&mut mem, AREAS).unwrap();
+        let mut cpu = RefCpu::new(loaded.entry);
+        let mut r = cpu.regs();
+        r.gpr[ESP] = loaded.stack_top;
+        cpu.set_regs(r);
+        assert!(matches!(hle.run(&mut cpu, &mut mem, 100_000), Err(crate::HleError::Deadlock(_))));
+    }
 }

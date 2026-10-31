@@ -112,6 +112,8 @@ pub struct Thread {
     stack_base: u32,
     stack_limit: u32,
     injected: Vec<Injected>,
+    /// The hidden thread that runs while every real thread waits.
+    idle: bool,
 }
 
 enum Clock {
@@ -257,6 +259,7 @@ impl Sched {
             stack_base,
             stack_limit,
             injected: Vec::new(),
+            idle: false,
         })
     }
 
@@ -269,7 +272,7 @@ impl Sched {
     }
 
     pub fn thread_count(&self) -> usize {
-        self.threads.iter().filter(|t| !matches!(t.state, State::Done)).count()
+        self.threads.iter().filter(|t| !t.idle && !matches!(t.state, State::Done)).count()
     }
 
     // ----- time -----
@@ -412,7 +415,7 @@ impl Sched {
     /// calls are the only place a switch is safe: no half-finished instruction state to save).
     pub fn note_call(&mut self) {
         self.calls_since_switch += 1;
-        if self.calls_since_switch >= 400 && self.threads.len() > 1 {
+        if self.calls_since_switch >= 400 && self.threads.len() > 1 + self.has_idle() as usize {
             self.switch = true;
         }
     }
@@ -656,11 +659,63 @@ impl Sched {
         }
         self.poll(bus);
         self.switch = true;
-        self.threads.iter().any(|t| !matches!(t.state, State::Done))
+        self.threads.iter().any(|t| !t.idle && !matches!(t.state, State::Done))
     }
 
     fn runnable(&self, i: usize) -> bool {
-        matches!(self.threads[i].state, State::Ready) && self.threads[i].suspend == 0
+        !self.threads[i].idle && matches!(self.threads[i].state, State::Ready) && self.threads[i].suspend == 0
+    }
+
+    /// Whether a real (non-idle) thread could run right now.
+    pub fn any_runnable(&self) -> bool {
+        (0..self.threads.len()).any(|i| self.runnable(i))
+    }
+
+    /// Whether the running thread is the idle thread.
+    pub fn in_idle(&self) -> bool {
+        self.threads.get(self.current).is_some_and(|t| t.idle)
+    }
+
+    /// Adds the idle thread: it runs the code at `code` (a loop that calls `ORD_IDLE`) on a
+    /// small stack of its own whenever every other thread waits, so timers, interrupts and
+    /// deferred calls get the CPU instead of the host spinning.
+    pub fn add_idle(&mut self, bus: &mut dyn Bus, code: u32) -> Option<()> {
+        let stack = self.kalloc(0x2000)?;
+        let mut t = self.make_thread(bus, 0, stack, stack + 0x2000)?;
+        t.idle = true;
+        t.regs.eip = code;
+        t.regs.gpr[ESP] = stack + 0x2000 - 16;
+        self.threads.push(t);
+        Some(())
+    }
+
+    fn has_idle(&self) -> bool {
+        self.threads.iter().any(|t| t.idle)
+    }
+
+    /// How long (in 100 ns units) until something timed happens, if anything will.
+    pub fn next_deadline(&self) -> Option<u64> {
+        self.threads
+            .iter()
+            .filter_map(|t| match &t.state {
+                State::Waiting(w) => w.deadline,
+                _ => None,
+            })
+            .chain(self.timers.iter().map(|t| t.due))
+            .min()
+    }
+
+    /// Sleeps the host for a moment (at most 1 ms) while the guest has nothing to do. Only
+    /// the real clock lets time pass by itself.
+    pub fn idle_wait(&self) {
+        if let Clock::Real { .. } = self.clock {
+            let now = self.now();
+            let ns = self.next_deadline().map_or(1_000_000, |d| d.saturating_sub(now).saturating_mul(100));
+            let ns = ns.min(1_000_000);
+            if ns > 0 {
+                std::thread::sleep(std::time::Duration::from_nanos(ns));
+            }
+        }
     }
 
     /// Saves the running thread (whose registers are `regs`) and loads the next runnable one.
@@ -680,17 +735,17 @@ impl Sched {
             if let Some(i) = (1..=n).map(|k| (cur + k) % n).find(|&i| self.runnable(i)) {
                 break i;
             }
-            // nothing can run: jump the clock to the next deadline
-            let soonest = self
-                .threads
-                .iter()
-                .filter_map(|t| match &t.state {
-                    State::Waiting(w) => w.deadline,
-                    _ => None,
-                })
-                .chain(self.timers.iter().map(|t| t.due))
-                .min();
+            // nothing can run
+            let soonest = self.next_deadline();
+            let waiting_for_device = self.interrupts.values().any(|i| i.connected);
+            let real = matches!(self.clock, Clock::Real { .. });
+            if real && self.has_idle() && (soonest.is_some() || waiting_for_device) {
+                // hand the CPU to the idle thread: timers, interrupts and deferred calls run
+                // there and may wake someone
+                break self.threads.iter().position(|t| t.idle).unwrap_or(cur);
+            }
             match soonest {
+                // a clock that only moves when asked: jump to the next deadline
                 Some(t) => self.advance_to(t),
                 None => return Err(HleError::Deadlock(self.describe_threads())),
             }
@@ -710,6 +765,7 @@ impl Sched {
     pub fn describe_threads(&self) -> String {
         self.threads
             .iter()
+            .filter(|t| !t.idle)
             .map(|t| {
                 let s = match &t.state {
                     State::Ready if t.suspend > 0 => format!("suspended x{}", t.suspend),

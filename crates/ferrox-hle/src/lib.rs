@@ -32,6 +32,7 @@ use std::collections::{HashMap, VecDeque};
 /// Pseudo-exports used by the loader's own code stubs.
 pub const ORD_THREAD_END: u32 = 0xFFFF_FF01;
 pub const ORD_INJECT_RETURN: u32 = 0xFFFF_FF02;
+pub const ORD_IDLE: u32 = 0xFFFF_FF03;
 /// Bytes from the start of a call stub to the `ret` that follows its hypercall.
 const STUB_TO_RET: u32 = 7;
 /// How many recent kernel calls the diagnostics keep.
@@ -392,7 +393,13 @@ impl KernelHle {
         mem.write(areas.stack_top as u64, 4, areas.stubs as u64 + 0x40)?;
         self.sched.thread_stub = areas.stubs;
         self.sched.inject_return = areas.stubs + 0x20;
+        // the idle thread: call ORD_IDLE forever
+        let mut idle = hyper(ORD_IDLE);
+        let back = -(idle.len() as i32 + 2) as i8 as u8;
+        idle.extend_from_slice(&[0xEB, back]);
+        mem.load(areas.stubs as u64 + 0x60, &idle)?;
         self.sched.init(mem, areas.kpcr, areas.objects, areas.stack_top, areas.stack_size);
+        self.sched.add_idle(mem, areas.stubs + 0x60);
         Ok(())
     }
 
@@ -450,6 +457,7 @@ impl KernelHle {
                 let name = match r.ordinal {
                     ORD_THREAD_END => "(thread ended)",
                     ORD_INJECT_RETURN => "(callback returned)",
+                    ORD_IDLE => "(idle)",
                     o => self.exports.get(&o).map_or("?", |e| e.name),
                 };
                 format!(
@@ -510,6 +518,19 @@ impl KernelHle {
                     PHASE.store(2 << 32 | ordinal as u64, std::sync::atomic::Ordering::Relaxed);
                     *self.counts.entry(ordinal).or_default() += 1;
                     let mut regs = cpu.regs();
+                    if ordinal == ORD_IDLE {
+                        // nothing to run: let a moment pass, then see who can go on
+                        self.sched.idle_wait();
+                        self.sched.tick(bus);
+                        self.sched.poll(bus);
+                        if self.sched.any_runnable() {
+                            self.sched.switch = true;
+                        }
+                        self.after_call(&mut regs, bus)?;
+                        cpu.set_regs(regs);
+                        budget = budget.saturating_sub(1);
+                        continue;
+                    }
                     if ordinal == ORD_THREAD_END || ordinal == ORD_INJECT_RETURN {
                         self.record(ordinal, &regs, bus);
                         if ordinal == ORD_THREAD_END {
