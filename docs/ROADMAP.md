@@ -14,7 +14,7 @@ decoder, CLI, tests.
 hard-drive images, CLI `run`/`hdd`/`demo`.
 
 **Next, in order:**
-1. Run `cargo test -p ferrox-kvm -- --ignored` on a KVM machine and fix what it finds.
+1. Run `cargo test -p ferrox-kvm -- --ignored` on a KVM machine and fix what it finds. (The Windows backend has run the demo on real hardware; its first bug was register-buffer alignment.)
 2. Kernel: threads and scheduling, events/semaphores/mutexes, DPCs and interrupts,
    file access (`NtCreateFile` and friends over the disc image and FATX drive E:).
 3. A homebrew program built with nxdk that only uses text output runs end to end.
