@@ -19,7 +19,16 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev libgl1-mesa-dev
       - name: Test
-        run: cargo test --workspace
+        shell: bash
+        run: |
+          # On failure, surface the compiler errors as annotations (the raw log
+          # is not always reachable by the people debugging remotely).
+          cargo test --workspace --no-run --color never 2>&1 | tee build.log || {
+            msg=$(grep -E '^(error|warning: unused)' -A8 build.log | head -c 6000 | tr -d '\r' | sed ':a;N;$!ba;s/%/%25/g;s/\n/%0A/g')
+            echo "::error title=rustc::$msg"
+            exit 1
+          }
+          cargo test --workspace
       - name: Build release binaries
         run: cargo build --release -p ferrox-app -p ferrox-cli
       - uses: actions/upload-artifact@v4
