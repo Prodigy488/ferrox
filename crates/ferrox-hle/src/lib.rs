@@ -175,6 +175,9 @@ struct IrqSource {
     last_fire: u64,
 }
 
+/// Kernel calls made so far by any game in this process: a sign of life for a watchdog.
+pub static KERNEL_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[derive(Default)]
 pub struct KernelHle {
     irq_sources: Vec<IrqSource>,
@@ -496,6 +499,7 @@ impl KernelHle {
             let n = budget.min(SLICE);
             match cpu.run(bus, n).map_err(|e: CpuError| HleError::Cpu(e.to_string()))? {
                 Exit::Hypercall(ordinal) => {
+                    KERNEL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     *self.counts.entry(ordinal).or_default() += 1;
                     let mut regs = cpu.regs();
                     if ordinal == ORD_THREAD_END || ordinal == ORD_INJECT_RETURN {

@@ -375,6 +375,7 @@ impl Gpu {
                         }
                     }
                 }
+                self.shared.set_activity(0);
             }
             Err(e) => {
                 self.shared.log(format!("command buffer error: {e}"));
@@ -388,6 +389,7 @@ impl Gpu {
 
     fn method(&mut self, sub: u8, m: u32, v: u32) {
         self.shared.count_method();
+        self.shared.set_activity(1 << 63 | (sub as u64) << 48 | (m as u64) << 32 | v as u64);
         if m == 0 {
             match self.ramht_lookup(v) {
                 Some(inst) => self.bound[sub as usize & 7] = inst,

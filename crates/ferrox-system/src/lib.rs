@@ -478,6 +478,44 @@ pub fn run(
         }
     };
     let started = std::time::Instant::now();
+    // a game that hangs the host itself (not just the guest) would never reach the report: a
+    // watchdog says what it can see from outside and ends the process
+    let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if let Some(limit) = cfg.probe {
+        let (done, gpu, say_to) = (finished.clone(), gpu_state.clone(), title.clone());
+        std::thread::spawn(move || {
+            std::thread::sleep(limit + std::time::Duration::from_secs(6));
+            if done.load(Ordering::Relaxed) {
+                return;
+            }
+            let calls = ferrox_hle::KERNEL_CALLS.load(Ordering::Relaxed);
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let now = ferrox_hle::KERNEL_CALLS.load(Ordering::Relaxed);
+            let act = gpu.activity();
+            let recent: Vec<String> = gpu
+                .recent_accesses()
+                .iter()
+                .rev()
+                .take(24)
+                .map(|&(w, o, v)| format!("{}{o:#x}={v:#x}", if w { "W" } else { "R" }))
+                .collect();
+            println!("[probe] HUNG: {say_to} did not come back to the probe loop {} s after its time was up", 8);
+            println!("[probe] kernel calls in the last 2 s: {} (total {now})", now - calls);
+            if act != 0 {
+                println!(
+                    "[probe] the GPU is stuck running a graphics method: subchannel {} method {:#x} value {:#x}",
+                    (act >> 48) & 7,
+                    (act >> 32) & 0xFFFF,
+                    act as u32
+                );
+            } else {
+                println!("[probe] the GPU is idle, so the loop is in the guest or the CPU backend");
+            }
+            println!("[probe] last GPU register accesses (newest first): {}", recent.join(" "));
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            std::process::exit(3);
+        });
+    }
     let outcome = loop {
         if stop.load(Ordering::Relaxed) {
             break Outcome::Stopped;
@@ -508,6 +546,7 @@ pub fn run(
             }
         }
     };
+    finished.store(true, Ordering::Relaxed);
     flush(&state);
     show(&mut mem, true);
     if cfg.probe.is_some() {

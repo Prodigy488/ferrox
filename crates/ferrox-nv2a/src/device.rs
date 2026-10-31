@@ -47,6 +47,8 @@ pub struct Shared {
     unhandled: Mutex<BTreeMap<(bool, u32), u32>>,
     /// The latest register accesses (is_write, offset, value), for finding what a stuck game waits on.
     recent: Mutex<std::collections::VecDeque<(bool, u32, u32)>>,
+    /// What the GPU is doing right now (0 = idle): the method being run, for finding a hang.
+    activity: AtomicU64,
     /// How often each register was touched.
     hot: Mutex<BTreeMap<(bool, u32), u64>>,
     gaps: Mutex<BTreeMap<String, u32>>,
@@ -88,6 +90,15 @@ impl Shared {
             0 => None,
             v => Some(v),
         }
+    }
+
+    pub(crate) fn set_activity(&self, v: u64) {
+        self.activity.store(v, Ordering::Relaxed);
+    }
+
+    /// 0 when the GPU is idle, else the graphics method it is running: subchannel << 48 | method << 32 | value.
+    pub fn activity(&self) -> u64 {
+        self.activity.load(Ordering::Relaxed)
     }
 
     pub(crate) fn trace(&self, write: bool, offset: u64, value: u32) {
