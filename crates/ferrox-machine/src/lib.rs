@@ -191,6 +191,16 @@ impl PhysMem {
             .collect()
     }
 
+    /// Borrows `len` bytes of RAM starting at `addr` (for copying out a
+    /// framebuffer). `None` if the span is not entirely inside one RAM region.
+    pub fn ram_bytes(&mut self, addr: GuestAddr, len: usize) -> Option<&[u8]> {
+        let (r, off) = self.find(addr, len)?;
+        match &r.backing {
+            Backing::Ram(v) => v.get(off as usize..off as usize + len),
+            _ => None,
+        }
+    }
+
     pub fn add_ram(&mut self, base: u64, size: usize) -> Result<(), MapError> {
         self.insert(base, size as u64, Backing::Ram(PageBuf::zeroed(size)))
     }

@@ -12,7 +12,7 @@ usage:
   ferrox ls <file.iso>                  list the files on a disc image
   ferrox pushbuffer <file> [get] [put]  decode a raw NV2A pushbuffer dump
                                         (get/put are hex byte offsets)
-  ferrox run <file.xbe|file.iso> [--hdd image] [--reference-cpu]
+  ferrox run <file.xbe|file.iso> [--hdd image] [--reference-cpu] [--save-frame out.ppm]
                                         run a game with no BIOS (needs KVM on Linux)
   ferrox hdd <new-image> [GiB]          create a formatted blank hard-drive image
   ferrox demo <folder>                  write a tiny demo game into <folder>/Demo";
@@ -26,15 +26,27 @@ fn run_cmd(args: &[String]) -> Result<(), String> {
         backend: ferrox_system::Backend::Auto,
         hdd: None,
     };
+    let mut save_frame: Option<String> = None;
     let mut it = args[1..].iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--hdd" => cfg.hdd = Some(it.next().ok_or("--hdd needs a path")?.into()),
             "--reference-cpu" => cfg.backend = ferrox_system::Backend::Reference,
+            "--save-frame" => save_frame = Some(it.next().ok_or("--save-frame needs a path")?.clone()),
             other => return Err(format!("unknown option {other}")),
         }
     }
-    let rep = ferrox_system::run(&cfg, &Arc::new(AtomicBool::new(false)), |s| print!("{s}"))?;
+    let mut last = None;
+    let rep = ferrox_system::run(&cfg, &Arc::new(AtomicBool::new(false)), |s| print!("{s}"), |f| last = Some(f))?;
+    if let Some(path) = save_frame {
+        let f = last.ok_or("the game never displayed a picture")?;
+        let mut out = format!("P6\n{} {}\n255\n", f.width, f.height).into_bytes();
+        for px in f.rgba.chunks_exact(4) {
+            out.extend_from_slice(&px[..3]);
+        }
+        std::fs::write(&path, out).map_err(|e| e.to_string())?;
+        eprintln!("saved {}x{} picture to {path}", f.width, f.height);
+    }
     eprintln!("[{}] {:?} on {}", rep.title, rep.outcome, rep.backend);
     Ok(())
 }

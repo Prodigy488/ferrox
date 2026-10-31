@@ -15,6 +15,7 @@
 
 pub mod exports;
 pub mod kernel;
+pub mod video;
 
 use exports::Conv;
 use ferrox_core::{Bus, BusError};

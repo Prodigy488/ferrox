@@ -2,7 +2,7 @@
 
 use eframe::egui::{self, Color32, RichText};
 use ferrox_app::{config_dir, gib, matches, scan, BootMode, Game, Settings};
-use ferrox_system::{Backend, Config, Report, Source};
+use ferrox_system::{Backend, Config, Frame, Report, Source};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver};
@@ -23,6 +23,7 @@ enum Tab {
 
 enum Msg {
     Out(String),
+    Frame(Frame),
     Done(Result<Report, String>),
 }
 
@@ -42,6 +43,7 @@ struct App {
     scan_cancel: Arc<AtomicBool>,
     run: Option<Running>,
     console: String,
+    picture: Option<egui::TextureHandle>,
     status: (String, Color32),
     kvm: bool,
     hdd_gib: u32,
@@ -74,6 +76,7 @@ impl App {
             scan_cancel: Arc::new(AtomicBool::new(false)),
             run: None,
             console: String::new(),
+            picture: None,
             status: ("Ready.".into(), MUTED),
             kvm: ferrox_system::hardware_virtualization(),
             hdd_gib: 8,
@@ -123,20 +126,30 @@ impl App {
         let (stop2, ctx2) = (stop.clone(), ctx.clone());
         std::thread::spawn(move || {
             let out = tx.clone();
-            let res = ferrox_system::run(&cfg, &stop2, |s| {
-                let _ = out.send(Msg::Out(s.to_string()));
-                ctx2.request_repaint();
-            });
+            let (out2, ctx3) = (tx.clone(), ctx2.clone());
+            let res = ferrox_system::run(
+                &cfg,
+                &stop2,
+                |s| {
+                    let _ = out.send(Msg::Out(s.to_string()));
+                    ctx2.request_repaint();
+                },
+                |f| {
+                    let _ = out2.send(Msg::Frame(f));
+                    ctx3.request_repaint();
+                },
+            );
             let _ = tx.send(Msg::Done(res));
             ctx2.request_repaint();
         });
         self.console.clear();
+        self.picture = None;
         self.status = (format!("Running {}…", game.title), ACCENT);
         self.run = Some(Running { title: game.title.clone(), stop, rx });
         self.tab = Tab::Play;
     }
 
-    fn poll(&mut self) {
+    fn poll(&mut self, ctx: &egui::Context) {
         if let Some(rx) = &self.scan_rx {
             let mut disconnected = false;
             loop {
@@ -156,10 +169,19 @@ impl App {
         }
         if let Some(run) = &self.run {
             let mut finished = None;
+            let mut newest: Option<Frame> = None;
             while let Ok(m) = run.rx.try_recv() {
                 match m {
                     Msg::Out(s) => self.console.push_str(&s),
+                    Msg::Frame(f) => newest = Some(f),
                     Msg::Done(r) => finished = Some(r),
+                }
+            }
+            if let Some(f) = newest {
+                let img = egui::ColorImage::from_rgba_unmultiplied([f.width as usize, f.height as usize], &f.rgba);
+                match &mut self.picture {
+                    Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+                    None => self.picture = Some(ctx.load_texture("screen", img, egui::TextureOptions::LINEAR)),
                 }
             }
             if let Some(r) = finished {
@@ -264,15 +286,25 @@ impl App {
             }
         });
         let w = ui.available_width().min(760.0);
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(w, w * 9.0 / 16.0), egui::Sense::hover());
+        let aspect = self.picture.as_ref().map(|t| t.aspect_ratio()).unwrap_or(4.0 / 3.0);
+        // Xbox pictures are 4:3 on screen even when the stored width is 720 or 640.
+        let shown = if self.picture.is_some() { 4.0 / 3.0 } else { aspect };
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(w, w / shown), egui::Sense::hover());
         ui.painter().rect_filled(rect, 6.0, Color32::BLACK);
-        ui.painter().text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            "No video yet\nGPU emulation is not built; programs can run and print, not draw.",
-            egui::FontId::proportional(15.0),
-            MUTED,
-        );
+        match &self.picture {
+            Some(t) => {
+                ui.painter().image(t.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+            }
+            None => {
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "No picture\nThe game has not set up a display, or it draws with the GPU,\nwhich is not emulated yet.",
+                    egui::FontId::proportional(15.0),
+                    MUTED,
+                );
+            }
+        }
         ui.label(RichText::new("Console (what the game prints)").color(MUTED));
         egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false; 2]).show(ui, |ui| {
             ui.add(egui::Label::new(RichText::new(&self.console).monospace()).wrap());
@@ -378,12 +410,13 @@ impl App {
         ui.add_space(8.0);
         ui.label(RichText::new("What works today").strong());
         ui.label("• Opens disc images and executables, builds formatted hard-drive images");
+        ui.label("• Shows a program's framebuffer (software drawing); 3D drawing needs the GPU, which is not emulated");
         ui.label("• Runs a program's own code on the real CPU (Linux KVM, Windows Hypervisor Platform) with the kernel provided in software");
         let (done, total) = ferrox_system::kernel_coverage();
         ui.label(format!("• The built-in kernel implements {done} of {total} functions (memory, debug text, time, shutdown)"));
         ui.add_space(8.0);
         ui.label(RichText::new("Not built yet").strong().color(WARN));
-        ui.label("• Graphics (NV2A), audio, USB controllers, networking, file access — so commercial games cannot run");
+        ui.label("• Graphics (NV2A 3D), audio, USB controllers, networking, file access — so commercial games cannot run");
         ui.label("• BIOS boot mode, macOS CPU backend");
         ui.label("• The KVM and Windows hypervisor backends compile but have not been run on real machines yet");
     }
@@ -391,7 +424,7 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
-        self.poll();
+        self.poll(ctx);
         if self.autolaunch && self.scan_rx.is_none() && !self.games.is_empty() && self.run.is_none() {
             self.autolaunch = false;
             let g = self.games[0].clone();

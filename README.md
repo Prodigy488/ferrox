@@ -7,7 +7,7 @@ features.
 
 **Status: early. ferrox can run a small program's own code with the kernel
 provided in software, and has a desktop app, but it cannot run commercial games:
-there is no graphics, audio, input or file access yet.** Everything below has
+there is no 3D graphics, audio, input or file access yet. Programs that draw into a plain framebuffer do show a picture.** Everything below has
 tests, except where it says otherwise.
 
 | Crate | What it does | State |
@@ -16,7 +16,7 @@ tests, except where it says otherwise.
 | `ferrox-machine` | Physical address space: RAM, mirrored ROM, MMIO and port devices | working, tested |
 | `ferrox-cpu` | CPU backend interface + a tiny test interpreter | done |
 | `ferrox-kvm` | Linux KVM backend: guest runs natively, only I/O and kernel calls exit | **compiles; never run** (no KVM on the dev machine). One ignored test awaits a KVM host |
-| `ferrox-hle` | No-BIOS kernel: loads an XBE, patches its imports, answers kernel calls | 22 of 337 kernel functions implemented; the rest stop the run and name themselves |
+| `ferrox-hle` | No-BIOS kernel: loads an XBE, patches its imports, answers kernel calls | 26 of 337 kernel functions implemented; the rest stop the run and name themselves |
 | `ferrox-system` | Assembles a machine, picks a CPU backend, runs a game | working with the test interpreter; KVM path untested |
 | `ferrox-nv2a` | GPU command-stream (pushbuffer) decoder | working, tested against xemu's `pfifo.c` rules |
 | `ferrox-app` | Desktop app `ferrox-gui`: library, play/console, settings, hard-drive creator | working; screenshots checked on a virtual display; no video yet |

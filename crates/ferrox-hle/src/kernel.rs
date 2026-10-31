@@ -5,6 +5,7 @@
 //! a few synchronisation no-ops for a single-threaded guest, and reboot. Threads,
 //! events, interrupts, files and display setup come next.
 
+use crate::video::{self, Framebuffer};
 use crate::{Call, KernelHle};
 use std::cell::RefCell;
 use std::ops::Range;
@@ -28,6 +29,10 @@ pub struct KernelState {
     pub system_time: u64,
     /// Why the guest asked to stop, if it did.
     pub stop_reason: Option<String>,
+    /// The picture the game last selected for display.
+    pub framebuffer: Option<Framebuffer>,
+    /// Value of the 'saved data' pointer games may keep across calls.
+    pub saved_data: u32,
 }
 
 impl KernelState {
@@ -218,6 +223,28 @@ pub fn install(hle: &mut KernelHle, heap: Range<u32>) -> Rc<RefCell<KernelState>
         0
     });
 
+    // --- display ---
+    let s = st.clone();
+    hle.handle("AvSetDisplayMode", move |c| {
+        // (RegisterBase, Step, DisplayMode, SourceColorFormat, Pitch, FrameBuffer);
+        // returns the next step to call with, 0 when finished.
+        let (Ok(mode), Ok(format), Ok(pitch), Ok(fb)) = (c.arg(2), c.arg(3), c.arg(4), c.arg(5)) else {
+            return 0;
+        };
+        let (width, height) = video::mode_size(mode).unwrap_or((pitch / 4, 480));
+        s.borrow_mut().framebuffer =
+            Some(Framebuffer { addr: fb & 0x03FF_FFFF, pitch, width, height, format });
+        0
+    });
+    hle.handle("AvSendTVEncoderOption", |_| 0);
+    let s = st.clone();
+    hle.handle("AvSetSavedDataAddress", move |c| {
+        s.borrow_mut().saved_data = c.arg(0).unwrap_or(0);
+        0
+    });
+    let s = st.clone();
+    hle.handle("AvGetSavedDataAddress", move |_| s.borrow().saved_data);
+
     // --- ending the run ---
     let s = st.clone();
     hle.handle("HalReturnToFirmware", move |c| {
@@ -379,6 +406,35 @@ mod tests {
         cpu.set_regs(r);
         let err = hle.run(&mut cpu, &mut mem, 1000).unwrap_err();
         assert!(err.to_string().contains("PsCreateSystemThreadEx"), "{err}");
+    }
+
+    #[test]
+    fn display_mode_selects_a_framebuffer() {
+        let mut hle = KernelHle::with_table();
+        let state = install(&mut hle, 0x100_0000..0x200_0000);
+        let ords = [ord("AvSetDisplayMode")];
+        let mut code = Vec::new();
+        // args pushed last-first: FrameBuffer, Pitch, Format, DisplayMode, Step, RegisterBase
+        for v in [0x8120_0000u32, 2560, 0x12, 0x0401_0101, 0, 0] {
+            code.extend(push(v));
+        }
+        code.extend(call_slot(0));
+        code.push(0xF4);
+        let mut file = build(true, &ords);
+        file[0x1000..0x1000 + code.len()].copy_from_slice(&code);
+        let xbe = Xbe::parse(&file).unwrap();
+        let mut mem = PhysMem::new();
+        mem.add_ram(0, 4 * 1024 * 1024).unwrap();
+        let loaded = hle.load(&mut mem, &xbe, &file, LAYOUT).unwrap();
+        let mut cpu = RefCpu::new(loaded.entry);
+        let mut r = cpu.regs();
+        r.gpr[ESP] = loaded.stack_top;
+        cpu.set_regs(r);
+        assert_eq!(hle.run(&mut cpu, &mut mem, 10_000).unwrap(), Exit::Halt);
+        let fb = state.borrow().framebuffer.unwrap();
+        assert_eq!((fb.width, fb.height, fb.pitch, fb.format), (640, 480, 2560, 0x12));
+        assert_eq!(fb.addr, 0x0120_0000, "the high mapping bit is dropped");
+        assert_eq!(cpu.regs().gpr[0], 0, "finished in one step");
     }
 
     #[test]

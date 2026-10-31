@@ -75,7 +75,7 @@ pub trait CpuBackend {
 }
 
 /// The test interpreter: nop, mov r32 imm32, mov eax/[abs32], inc/dec r32,
-/// add eax imm32, jmp/jne rel8, push imm32, add r32 imm8, call [abs32], ret / ret imm16,
+/// add eax imm32, jmp/jne rel8, push imm32/r32, pop r32, mov [r32]/r32 r32, add r32 imm8, call [abs32], ret / ret imm16,
 /// in/out (8-bit imm8 and dx forms; `out imm8, eax` for the hypercall port), hlt.
 #[derive(Default)]
 pub struct RefCpu {
@@ -135,6 +135,26 @@ impl CpuBackend for RefCpu {
             let op = self.fetch8(bus)?;
             match op {
                 0x90 => {}
+                0x50..=0x57 => {
+                    let v = self.regs.gpr[(op - 0x50) as usize];
+                    self.push(bus, v)?;
+                }
+                0x58..=0x5F => {
+                    let v = self.pop(bus)?;
+                    self.regs.gpr[(op - 0x58) as usize] = v;
+                }
+                0x89 => {
+                    // mov r/m32, r32: register-to-register, or store through [reg]
+                    let modrm = self.fetch8(bus)?;
+                    let (md, reg, rm) = (modrm >> 6, ((modrm >> 3) & 7) as usize, (modrm & 7) as usize);
+                    match md {
+                        3 => self.regs.gpr[rm] = self.regs.gpr[reg],
+                        0 if rm != 4 && rm != 5 => {
+                            bus.write(self.regs.gpr[rm] as u64, 4, self.regs.gpr[reg] as u64)?
+                        }
+                        _ => return Err(CpuError::Unimplemented { eip: at, opcode: op }),
+                    }
+                }
                 0xB8..=0xBF => {
                     let v = self.fetch32(bus)?;
                     self.regs.gpr[(op - 0xB8) as usize] = v;

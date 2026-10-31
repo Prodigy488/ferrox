@@ -8,6 +8,7 @@ use ferrox_cpu::{CpuBackend, Exit, RefCpu, ESP};
 use ferrox_formats::xbe::Xbe;
 use ferrox_formats::xdvdfs::Xdvdfs;
 use ferrox_hle::kernel::{self, KernelState};
+use ferrox_hle::video::Framebuffer;
 use ferrox_hle::{KernelHle, Layout};
 use ferrox_machine::PhysMem;
 use std::fs::File;
@@ -21,6 +22,19 @@ const GDT_ADDR: u32 = 0x500;
 const STACK_TOP: u32 = 0x00E0_0000 - 16;
 const LAYOUT: Layout = Layout { stub_base: 0x00F0_0000, data_base: 0x00F1_0000, stack_top: STACK_TOP };
 const HEAP: std::ops::Range<u32> = 0x0200_0000..0x03F0_0000;
+
+/// One picture, ready to show: RGBA8, `width * height * 4` bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Frame {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+fn snapshot(mem: &mut PhysMem, fb: &Framebuffer) -> Option<Frame> {
+    let rgba = fb.to_rgba(mem.ram_bytes(fb.addr as u64, fb.len())?)?;
+    Some(Frame { width: fb.width, height: fb.height, rgba })
+}
 
 /// What to run.
 #[derive(Clone, Debug)]
@@ -181,11 +195,13 @@ fn make_backend(
 }
 
 /// Runs the configured game until it stops. `on_output` receives text the
-/// guest prints; `stop` ends the run when set.
+/// guest prints, `on_frame` the picture it is displaying (at most about 30 times
+/// a second, plus once more at the end); `stop` ends the run when set.
 pub fn run(
     cfg: &Config,
     stop: &Arc<AtomicBool>,
     mut on_output: impl FnMut(&str),
+    mut on_frame: impl FnMut(Frame),
 ) -> Result<Report, String> {
     if let Some(h) = &cfg.hdd {
         let parts = ferrox_formats::hdd::inspect(h).map_err(|e| format!("hard-drive image: {e}"))?;
@@ -220,12 +236,25 @@ pub fn run(
             on_output(&std::mem::take(&mut s.debug));
         }
     };
+    let mut last_frame = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    let mut show = |mem: &mut PhysMem, force: bool| {
+        let Some(fb) = state.borrow().framebuffer else { return };
+        if force || last_frame.elapsed() >= std::time::Duration::from_millis(33) {
+            last_frame = std::time::Instant::now();
+            if let Some(f) = snapshot(mem, &fb) {
+                on_frame(f);
+            }
+        }
+    };
     let outcome = loop {
         if stop.load(Ordering::Relaxed) {
             break Outcome::Stopped;
         }
         match hle.run(cpu.as_mut(), &mut mem, 1_000_000) {
-            Ok(Exit::Budget) => flush(&state),
+            Ok(Exit::Budget) => {
+                flush(&state);
+                show(&mut mem, false);
+            }
             Ok(Exit::Halt) => {
                 let reason = state.borrow().stop_reason.clone();
                 break match reason {
@@ -236,41 +265,66 @@ pub fn run(
             Ok(Exit::Hypercall(_)) => unreachable!("handled inside KernelHle::run"),
             Err(e) => {
                 flush(&state);
+                show(&mut mem, true);
                 return Err(e.to_string());
             }
         }
     };
     flush(&state);
+    show(&mut mem, true);
     Ok(Report { outcome, backend, title })
 }
 
-/// A tiny demo executable that prints a greeting through the kernel and shuts
-/// down. Useful for checking an installation without any commercial game.
+/// A tiny demo executable: allocates a 640x480 framebuffer, selects it as the
+/// display, fills it with a test pattern, prints a greeting and shuts down.
+/// Useful for checking an installation without any commercial game.
 pub fn demo_xbe() -> Vec<u8> {
     use ferrox_formats::xbe::synth::{build, BASE};
     use ferrox_hle::exports;
-    let ords: Vec<u32> = ["DbgPrint", "HalReturnToFirmware"]
-        .iter()
-        .map(|n| exports::by_name(n).unwrap().ordinal)
-        .collect();
-    let slot = |i: u32| {
+    const GREETING: &[u8] = b"hello, xbox! (test pattern drawn)\n\0";
+    let names = ["DbgPrint", "HalReturnToFirmware", "MmAllocateContiguousMemory", "AvSetDisplayMode"];
+    let ords: Vec<u32> = names.iter().map(|n| exports::by_name(n).unwrap().ordinal).collect();
+    let call = |i: u32| {
         let mut v = vec![0xFF, 0x15];
         v.extend_from_slice(&(BASE + 0x2000 + 4 * i).to_le_bytes());
         v
     };
-    // The format string lives in .rdata after the thunk table (BASE+0x2010).
-    let mut code = vec![0x68];
-    code.extend_from_slice(&(BASE + 0x2010).to_le_bytes());
-    code.extend(slot(0));
-    code.extend_from_slice(&[0x83, 0xC4, 4, 0x68, 0, 0, 0, 0]);
-    code.extend(slot(1));
-    code.push(0xF4);
+    let push = |v: u32| {
+        let mut o = vec![0x68];
+        o.extend_from_slice(&v.to_le_bytes());
+        o
+    };
+    let mov = |op: u8, v: u32| {
+        let mut o = vec![op];
+        o.extend_from_slice(&v.to_le_bytes());
+        o
+    };
+    let mut c = Vec::new();
+    c.extend(push(640 * 480 * 4));
+    c.extend(call(2)); // eax = MmAllocateContiguousMemory(size)
+    c.extend([0x89, 0xC3, 0x89, 0xC7]); // mov ebx, eax ; mov edi, eax
+    c.push(0x53); // push ebx (FrameBuffer)
+    for v in [2560, 0x12, 0x0401_0101, 0, 0] {
+        c.extend(push(v)); // Pitch, Format (A8R8G8B8), DisplayMode (640x480 NTSC), Step, RegisterBase
+    }
+    c.extend(call(3)); // AvSetDisplayMode
+    c.extend(mov(0xB9, 640 * 480)); // mov ecx, pixel count
+    c.extend(mov(0xB8, 0xFF00_0000)); // mov eax, first colour
+    // loop: mov [edi], eax ; add edi, 4 ; add eax, step ; dec ecx ; jne loop
+    c.extend([0x89, 0x07, 0x83, 0xC7, 0x04]);
+    c.extend(mov(0x05, 0x0001_0203));
+    c.extend([0x49, 0x75, 0xF3]);
+    c.extend(push(BASE + 0x2040));
+    c.extend(call(0)); // DbgPrint(greeting)
+    c.extend([0x83, 0xC4, 0x04]);
+    c.extend(push(0));
+    c.extend(call(1)); // HalReturnToFirmware(0)
+    c.push(0xF4);
     let mut file = build(true, &ords);
-    file[0x1000..0x1000 + code.len()].copy_from_slice(&code);
-    file[0x2010..0x2010 + 14].copy_from_slice(b"hello, xbox!\n\0");
+    file[0x1000..0x1000 + c.len()].copy_from_slice(&c);
+    file[0x2040..0x2040 + GREETING.len()].copy_from_slice(GREETING);
     file
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -293,8 +347,14 @@ mod tests {
         std::fs::write(&path, demo_xbe()).unwrap();
         let cfg = Config { source: Source::from_path(&path), backend: Backend::Reference, hdd: None };
         let mut out = String::new();
-        let rep = run(&cfg, &Arc::new(AtomicBool::new(false)), |s| out.push_str(s)).unwrap();
-        assert_eq!(out, "hello, xbox!\n");
+        let mut frames = Vec::new();
+        let rep = run(&cfg, &Arc::new(AtomicBool::new(false)), |s| out.push_str(s), |f| frames.push(f)).unwrap();
+        assert_eq!(out, "hello, xbox! (test pattern drawn)\n");
+        let last = frames.last().expect("the demo displays a picture");
+        assert_eq!((last.width, last.height), (640, 480));
+        assert_eq!(last.rgba.len(), 640 * 480 * 4);
+        assert_eq!(&last.rgba[0..8], &[0, 0, 0, 255, 1, 2, 3, 255]);
+        assert_ne!(&last.rgba[0..4], &last.rgba[last.rgba.len() - 4..], "the pattern varies across the screen");
         assert_eq!(rep.outcome, Outcome::GuestStopped("HalReturnToFirmware(0)".into()));
         assert!(rep.backend.starts_with("reference"));
         std::fs::remove_dir_all(&dir).unwrap();
@@ -315,7 +375,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
             s2.store(true, Ordering::Relaxed);
         });
-        let rep = run(&cfg, &stop, |_| {}).unwrap();
+        let rep = run(&cfg, &stop, |_| {}, |_| {}).unwrap();
         t.join().unwrap();
         assert_eq!(rep.outcome, Outcome::Stopped);
         std::fs::remove_dir_all(dir).unwrap();
@@ -328,6 +388,6 @@ mod tests {
             backend: Backend::Reference,
             hdd: None,
         };
-        assert!(run(&cfg, &Arc::new(AtomicBool::new(false)), |_| {}).unwrap_err().contains("cannot read"));
+        assert!(run(&cfg, &Arc::new(AtomicBool::new(false)), |_| {}, |_| {}).unwrap_err().contains("cannot read"));
     }
 }
