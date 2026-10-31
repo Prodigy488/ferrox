@@ -13,6 +13,7 @@ use std::rc::Rc;
 
 pub const STATUS_SUCCESS: u32 = 0;
 pub const STATUS_NO_MEMORY: u32 = 0xC000_0017;
+
 /// End of the 64 MB of RAM.
 const RAM_TOP: u32 = 64 * 1024 * 1024;
 const PAGE: u32 = 4096;

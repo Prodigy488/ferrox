@@ -555,7 +555,10 @@ fn open_file(c: &mut Call, files: &Rc<RefCell<Files>>, out: u32, oa: u32, iosb: 
     let rootinfo = if root != 0 {
         match f.open.get(&root) {
             Some(o) => Some((o.dev, o.path.clone())),
-            None => return STATUS_INVALID_HANDLE,
+            None => {
+                f.note(format!("open {name:?} relative to handle {root:#x}, which is not a folder opened here -> invalid handle"));
+                return STATUS_INVALID_HANDLE;
+            }
         }
     } else {
         None

@@ -53,6 +53,10 @@ fn known_pfifo(off: u32) -> bool {
 // Kelvin (class 0x97) methods
 const NV097_NO_OPERATION: u32 = 0x100;
 const NV097_SET_CONTEXT_DMA_NOTIFIES: u32 = 0x180;
+const NV097_WAIT_FOR_IDLE: u32 = 0x110;
+const NV097_SET_CONTEXT_DMA_SEMAPHORE: u32 = 0x1A4;
+const NV097_SET_SEMAPHORE_OFFSET: u32 = 0x1D6C;
+const NV097_BACK_END_WRITE_SEMAPHORE_RELEASE: u32 = 0x1D70;
 const NV097_SET_CONTEXT_DMA_COLOR: u32 = 0x194;
 const NV097_SET_CONTEXT_DMA_ZETA: u32 = 0x198;
 const NV097_SET_SURFACE_CLIP_HORIZONTAL: u32 = 0x200;
@@ -148,6 +152,8 @@ pub struct Gpu {
     kelvin: BTreeMap<u32, u32>,
     color_base: u32,
     zeta_base: u32,
+    semaphore_base: u32,
+    semaphore_offset: u32,
     /// Current value of each of the 16 vertex attributes (position is 0, diffuse 3).
     attrs: [[f32; 4]; 16],
     /// Primitive type between Begin and End, 0 outside.
@@ -174,6 +180,8 @@ impl Gpu {
             kelvin: BTreeMap::new(),
             color_base: 0,
             zeta_base: 0,
+            semaphore_base: 0,
+            semaphore_offset: 0,
             attrs: Self::initial_attrs(),
             prim: 0,
             verts: Vec::new(),
@@ -405,7 +413,20 @@ impl Gpu {
 
     fn kelvin_method(&mut self, m: u32, v: u32) {
         match m {
-            NV097_NO_OPERATION => {}
+            // everything runs the moment it is submitted, so there is never anything to wait for
+            NV097_NO_OPERATION | NV097_WAIT_FOR_IDLE => {}
+            NV097_SET_CONTEXT_DMA_SEMAPHORE => match self.dma_base_of(v) {
+                Some(b) => self.semaphore_base = b,
+                None => self.shared.log(format!("semaphore DMA handle {v:#x} is not in the hash table")),
+            },
+            NV097_SET_SEMAPHORE_OFFSET => self.semaphore_offset = v,
+            NV097_BACK_END_WRITE_SEMAPHORE_RELEASE => {
+                // the way a game learns the GPU got this far: a number appears in memory
+                let at = self.semaphore_base as u64 + self.semaphore_offset as u64;
+                if let Some(r) = &self.ram {
+                    r.write(at, &v.to_le_bytes());
+                }
+            }
             NV097_SET_CONTEXT_DMA_COLOR => match self.dma_base_of(v) {
                 Some(b) => self.color_base = b,
                 None => self.shared.log(format!("colour DMA handle {v:#x} is not in the hash table")),
@@ -1059,6 +1080,23 @@ mod tests {
         g.ramin_write(0x48, 4, 0x0123_4000 | 3);
         let d = g.dma_object(0x40);
         assert_eq!(d, DmaObject { class: 0x3D, target: 2, address: 0x0123_4001, limit: 0xFFF });
+    }
+
+    #[test]
+    fn a_semaphore_release_writes_a_number_to_memory() {
+        let (mut g, shared, mut mem) = setup();
+        init(&mut g);
+        kick(
+            &mut g,
+            &mut mem,
+            &[
+                hdr(0, 1), KELVIN, hdr(0x110, 1), 0, hdr(0x1A4, 1), COLOR_DMA,
+                hdr(0x1D6C, 1), 0x40, hdr(0x1D70, 1), 7, hdr(0x1D6C, 1), 0x44, hdr(0x1D70, 1), 9,
+            ],
+        );
+        let ram = mem.ram_view(0).unwrap();
+        assert_eq!((ram.read_u32(0x40), ram.read_u32(0x44)), (Some(7), Some(9)));
+        assert!(shared.gaps().is_empty(), "{:?}", shared.gaps());
     }
 
     #[test]

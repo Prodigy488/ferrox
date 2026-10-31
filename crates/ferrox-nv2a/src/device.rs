@@ -10,6 +10,7 @@ use ferrox_machine::{Mmio, RamView};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 /// Where the register window sits in the physical address space.
 pub const BASE: u64 = 0xFD00_0000;
@@ -143,7 +144,22 @@ pub struct Nv2a {
     raster: u32,
     status_toggle: bool,
     gpu: Gpu,
+    started: Instant,
+    /// Registers nothing models yet read back what was written, as plain storage does.
+    scratch: BTreeMap<u32, u32>,
 }
+
+// PBUS: a window onto the chip's PCI configuration
+const PBUS_PCI_ID: u64 = 0x1800;
+const PBUS_PCI_COMMAND: u64 = 0x1804;
+const PBUS_PCI_CLASS: u64 = 0x1808;
+// PTIMER
+const PTIMER_NUMERATOR: u64 = 0x9200;
+const PTIMER_DENOMINATOR: u64 = 0x9210;
+const PTIMER_TIME_0: u64 = 0x9400;
+const PTIMER_TIME_1: u64 = 0x9410;
+/// The chip's core clock.
+const CORE_CLOCK_HZ: u128 = 233_333_333;
 
 impl Nv2a {
     pub fn new() -> (Nv2a, Arc<Shared>) {
@@ -153,6 +169,8 @@ impl Nv2a {
             raster: 0,
             status_toggle: false,
             gpu: Gpu::new(shared.clone()),
+            started: Instant::now(),
+            scratch: BTreeMap::new(),
         };
         (dev, shared)
     }
@@ -160,6 +178,15 @@ impl Nv2a {
     /// Gives the GPU access to system memory (command buffers and surfaces live there).
     pub fn attach_ram(&mut self, ram: RamView) {
         self.gpu.attach_ram(ram);
+    }
+
+    /// The timer's 64-bit count as its two registers show it: it ticks at the core clock scaled
+    /// by the programmed ratio, and the registers drop the low 5 bits.
+    fn timer(&self) -> u64 {
+        let (num, den) = (self.scratch.get(&(PTIMER_NUMERATOR as u32)).copied().unwrap_or(1), self.scratch.get(&(PTIMER_DENOMINATOR as u32)).copied().unwrap_or(1));
+        let (num, den) = (num.max(1) as u128, den.max(1) as u128);
+        let ticks = self.started.elapsed().as_nanos() * CORE_CLOCK_HZ / 1_000_000_000 * den / num;
+        (ticks as u64) << 5
     }
 }
 
@@ -180,6 +207,12 @@ impl Mmio for Nv2a {
         }
         match offset {
             PMC_BOOT_0 => BOOT_0_VALUE as u64,
+            PBUS_PCI_ID => 0x02A0_10DE,
+            PBUS_PCI_COMMAND => self.scratch.get(&(PBUS_PCI_COMMAND as u32)).copied().unwrap_or(0) as u64,
+            PBUS_PCI_CLASS => 0x0300_00A1,
+            PTIMER_TIME_0 => (self.timer() & 0xFFFF_FFE0) as u64,
+            PTIMER_TIME_1 => ((self.timer() >> 32) & 0x1FFF_FFFF) as u64,
+            PTIMER_NUMERATOR | PTIMER_DENOMINATOR => self.scratch.get(&(offset as u32)).copied().unwrap_or(1) as u64,
             PMC_INTR_0 => self.shared.pmc_pending() as u64,
             PMC_INTR_EN_0 => self.shared.pmc_intr_en.load(Ordering::Relaxed) as u64,
             PCRTC_INTR_0 => self.shared.pcrtc_intr.load(Ordering::Relaxed) as u64,
@@ -196,7 +229,7 @@ impl Mmio for Nv2a {
             }
             _ => {
                 self.shared.note(false, offset);
-                0
+                self.scratch.get(&(offset as u32)).copied().unwrap_or(0) as u64
             }
         }
     }
@@ -215,12 +248,18 @@ impl Mmio for Nv2a {
         }
         match offset {
             PMC_INTR_EN_0 => self.shared.pmc_intr_en.store(v, Ordering::Relaxed),
+            PBUS_PCI_COMMAND | PTIMER_NUMERATOR | PTIMER_DENOMINATOR => {
+                self.scratch.insert(offset as u32, v);
+            }
             PCRTC_INTR_0 => {
                 self.shared.pcrtc_intr.fetch_and(!v, Ordering::Relaxed); // write one to clear
             }
             PCRTC_INTR_EN_0 => self.shared.pcrtc_intr_en.store(v, Ordering::Relaxed),
             PCRTC_START => self.shared.display_start.store(v & 0x07FF_FFFF, Ordering::Relaxed),
-            _ => self.shared.note(true, offset),
+            _ => {
+                self.shared.note(true, offset);
+                self.scratch.insert(offset as u32, v);
+            }
         }
     }
 }
@@ -228,6 +267,19 @@ impl Mmio for Nv2a {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pci_window_timer_and_plain_registers() {
+        let (mut d, _) = Nv2a::new();
+        assert_eq!(d.read(0x1800, 4), 0x02A0_10DE);
+        assert_eq!(d.read(0x1808, 4) >> 8, 0x030000);
+        let a = d.read(PTIMER_TIME_0, 4);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let b = d.read(PTIMER_TIME_0, 4);
+        assert!(b > a, "the timer runs: {a:#x} then {b:#x}");
+        d.write(0x200, 4, 0x1100);
+        assert_eq!(d.read(0x200, 4), 0x1100, "an unmodelled register reads back");
+    }
 
     #[test]
     fn chip_id_matches_xemu() {

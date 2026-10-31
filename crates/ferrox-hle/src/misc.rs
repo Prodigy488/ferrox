@@ -82,6 +82,18 @@ fn setting(index: u32) -> Option<u32> {
     })
 }
 
+/// The factory-programmed values (serial number, network address, keys, regions): byte strings.
+fn factory_setting(index: u32) -> Option<Vec<u8>> {
+    Some(match index {
+        0x100 => b"000000000000".to_vec(),                       // serial number
+        0x101 => vec![0x00, 0x50, 0xF2, 0x00, 0x00, 0x01],       // network address
+        0x102 => vec![0; 16],                                    // online key
+        0x103 => 0x0040_0100u32.to_le_bytes().to_vec(),          // video region: NTSC-M
+        0x104 => 1u32.to_le_bytes().to_vec(),                    // game region: North America
+        _ => return None,
+    })
+}
+
 // ---- SHA-1 over a guest-held context (5 state words, 64-bit byte count, 64-byte buffer) ----
 
 fn sha_block(h: &mut [u32; 5], block: &[u8]) {
@@ -342,18 +354,22 @@ pub fn install(hle: &mut KernelHle, st: Rc<RefCell<KernelState>>) {
     hle.handle("ExQueryNonVolatileSetting", |c| {
         // (ValueIndex, Type*, Value*, ValueLength, ResultLength*)
         let (index, ty, val, len, res) = (arg(c, 0), arg(c, 1), arg(c, 2), arg(c, 3), arg(c, 4));
-        let Some(v) = setting(index) else { return STATUS_OBJECT_NAME_NOT_FOUND };
-        if len < 4 {
+        let (kind, bytes) = match (setting(index), factory_setting(index)) {
+            (Some(v), _) => (4, v.to_le_bytes().to_vec()), // REG_DWORD
+            (None, Some(b)) => (3, b),                     // REG_BINARY
+            _ => return STATUS_OBJECT_NAME_NOT_FOUND,
+        };
+        if res != 0 {
+            let _ = c.write_u32(res, bytes.len() as u32);
+        }
+        if (len as usize) < bytes.len() {
             return STATUS_BUFFER_TOO_SMALL;
         }
         if ty != 0 {
-            let _ = c.write_u32(ty, 4); // REG_DWORD
+            let _ = c.write_u32(ty, kind);
         }
         if val != 0 {
-            let _ = c.write_u32(val, v);
-        }
-        if res != 0 {
-            let _ = c.write_u32(res, 4);
+            let _ = c.bus.write_bytes(val as u64, &bytes);
         }
         STATUS_SUCCESS
     });
@@ -605,5 +621,6 @@ mod tests {
     fn known_settings_have_values_and_unknown_ones_do_not() {
         assert_eq!(setting(7), Some(1));
         assert_eq!(setting(0x999), None);
+        assert_eq!(factory_setting(0x103).unwrap(), vec![0x00, 0x01, 0x40, 0x00]);
     }
 }
