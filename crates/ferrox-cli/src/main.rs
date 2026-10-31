@@ -15,7 +15,9 @@ usage:
   ferrox run <file.xbe|file.iso> [--hdd image] [--reference-cpu] [--save-frame out.png|out.ppm]
                                         run a game with no BIOS (needs KVM on Linux)
   ferrox hdd <new-image> [GiB]          create a formatted blank hard-drive image
-  ferrox demo <folder>                  write a tiny demo game into <folder>/Demo";
+  ferrox demo <folder>                  write a tiny demo game into <folder>/Demo
+  ferrox selftest [--no-hardware|--hardware] [folder]
+                                        run the built-in checks and write pictures into <folder>";
 
 fn run_cmd(args: &[String]) -> Result<(), String> {
     use std::sync::atomic::AtomicBool;
@@ -54,6 +56,28 @@ fn run_cmd(args: &[String]) -> Result<(), String> {
     }
     eprintln!("[{}] {:?} on {}", rep.title, rep.outcome, rep.backend);
     Ok(())
+}
+
+fn selftest_cmd(args: &[String]) -> Result<(), String> {
+    use ferrox_system::selftest::{run_all, summary, Mode};
+    use std::io::Write;
+    let mut mode = Mode::All;
+    let mut dir = std::path::PathBuf::from("selftest-output");
+    for a in args {
+        match a.as_str() {
+            "--no-hardware" => mode = Mode::NoHardware,
+            "--hardware" => mode = Mode::HardwareOnly,
+            other if other.starts_with("--") => return Err(format!("unknown option {other}")),
+            other => dir = other.into(),
+        }
+    }
+    let checks = run_all(&dir, mode, &mut |s| {
+        print!("{s}");
+        let _ = std::io::stdout().flush();
+    });
+    let (pass, fail, skip) = summary(&checks);
+    println!("selftest: {pass} passed, {fail} failed, {skip} skipped");
+    if fail > 0 { Err(format!("{fail} check(s) failed")) } else { Ok(()) }
 }
 
 fn hdd_cmd(args: &[String]) -> Result<(), String> {
@@ -194,6 +218,7 @@ fn main() -> ExitCode {
         Some("run") => run_cmd(&args[1..]),
         Some("hdd") => hdd_cmd(&args[1..]),
         Some("demo") => demo_cmd(&args[1..]),
+        Some("selftest") => selftest_cmd(&args[1..]),
         _ => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;

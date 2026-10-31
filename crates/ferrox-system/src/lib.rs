@@ -167,6 +167,8 @@ impl std::fmt::Display for Outcome {
 }
 
 /// (kernel functions implemented, kernel functions in the table).
+pub mod selftest;
+
 pub fn kernel_coverage() -> (usize, usize) {
     let mut hle = KernelHle::with_table();
     kernel::install(&mut hle, HEAP);
@@ -612,40 +614,30 @@ mod tests {
         let mut out = String::new();
         let mut frames = Vec::new();
         let rep = run(&cfg, &Arc::new(AtomicBool::new(false)), |s| out.push_str(s), |f| frames.push(f)).unwrap();
-        let game_out: String = out.lines().filter(|l| !l.starts_with("[ferrox]")).map(|l| format!("{l}\n")).collect();
-        assert_eq!(game_out, "gpu id: 02a000a3\ngpu took 940 bytes of commands\nhello, xbox! (test pattern drawn)\n");
-        assert!(out.contains("display set: 640x480"), "{out}");
-        assert!(out.contains("gpu id: 02a000a3"), "{out}");
-        assert!(!out.contains("registers touched but not emulated"), "the demo only uses implemented registers: {out}");
-        assert!(out.contains("GPU work not emulated yet: register combiners"), "the one known gap is reported: {out}");
-        assert!(!out.contains("registers touched but not emulated"), "{out}");
-        assert!(!out.contains("; "), "no other gaps: {out}");
-        assert!(out.contains("CPU: reference"), "{out}");
         let last = frames.last().expect("the demo displays a picture");
+        let failed: Vec<String> = selftest::check_demo_output(&out)
+            .into_iter()
+            .chain(selftest::check_demo_frame(last))
+            .filter(|c| c.status == selftest::Status::Fail)
+            .map(|c| c.line())
+            .collect();
+        assert!(failed.is_empty(), "{failed:#?}\n{out}");
+        assert!(out.contains("CPU: reference"), "{out}");
         assert_eq!((last.width, last.height), (640, 480));
-        assert_eq!(last.rgba.len(), 640 * 480 * 4);
-        assert_eq!(&last.rgba[0..8], &[0, 0, 0, 255, 1, 2, 3, 255]);
-        assert_ne!(&last.rgba[0..4], &last.rgba[last.rgba.len() - 4..], "the pattern varies across the screen");
-        let px = |x: usize, y: usize| last.rgba[(y * 640 + x) * 4..][..4].to_vec();
-        assert_eq!(px(150, 100), [0xE0, 0x80, 0x20, 0xFF], "outer rectangle drawn by the GPU");
-        assert_eq!(px(200, 240), [0x10, 0x20, 0x60, 0xFF], "inner rectangle drawn by the GPU");
-        assert_ne!(px(99, 100), [0xE0, 0x80, 0x20, 0xFF], "outside the rectangle is still the gradient");
-        let top = px(320, 170);
-        assert!(top[0] > 0xC0 && top[1] < 0x40 && top[2] < 0x40, "triangle is red near its top corner: {top:?}");
-        let mid = px(320, 280);
-        assert!(mid[0] > 0x10 && mid[1] > 0x20 && mid[2] > 0x20, "colours blend inside the triangle: {mid:?}");
-        assert_eq!(px(200, 160), [0x10, 0x20, 0x60, 0xFF], "outside the triangle is still the inner rectangle");
-        assert_eq!(px(492, 212), [85, 170, 0x80, 0xFF], "texel (1, 2) of the texture on the right-hand quad");
-        assert_eq!(px(522, 238), [255, 255, 0x80, 0xFF], "texel (3, 3)");
-        assert_eq!(px(420, 232), [0xFF, 0xFF, 0xFF, 0xFF], "the farther white quad shows where nothing is in front of it");
-        let hidden = px(350, 232);
-        assert!(hidden != [0xFF, 0xFF, 0xFF, 0xFF] && hidden[0] > 0x10, "the quad is hidden behind the triangle: {hidden:?}");
-        let arr = px(140, 270);
-        assert!(arr[0] > 0x80 && arr[1] > 0x80 && arr != [0xE0, 0x80, 0x20, 0xFF], "triangle read from a vertex array: {arr:?}");
-        assert_eq!(px(120, 200), [0xE0, 0x80, 0x20, 0xFF], "outside the array triangle is still orange");
-        assert!(out.contains("GPU ran 159 commands (3 surface clears, 6 triangles)"), "{out}");
         assert_eq!(rep.outcome, Outcome::GuestStopped("HalReturnToFirmware(0)".into()));
         assert!(rep.backend.starts_with("reference"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_builtin_selftest_passes_without_the_fast_cpu() {
+        let dir = std::env::temp_dir().join(format!("ferrox-selftest-{}", std::process::id()));
+        let mut log = String::new();
+        let checks = selftest::run_all(&dir, selftest::Mode::NoHardware, &mut |s| log.push_str(s));
+        let (pass, fail, _) = selftest::summary(&checks);
+        assert_eq!(fail, 0, "{log}");
+        assert!(pass >= 25, "{log}");
+        assert!(dir.join("selftest-interpreter.png").exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

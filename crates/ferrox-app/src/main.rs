@@ -50,6 +50,17 @@ struct App {
     hdd_note: Option<(String, Color32)>,
     /// Development aid: launch the first game found (FERROX_AUTOLAUNCH=1).
     autolaunch: bool,
+    last_frame: Option<Frame>,
+    smoke: Option<Smoke>,
+}
+
+/// `ferrox-gui --smoke <folder>`: open the window, play the built-in demo, write
+/// what happened to <folder>/gui-smoke.txt and close. For checking a new machine.
+struct Smoke {
+    dir: PathBuf,
+    started: std::time::Instant,
+    launched: bool,
+    opened_noted: bool,
 }
 
 impl App {
@@ -64,8 +75,20 @@ impl App {
             s.spacing.item_spacing = egui::vec2(10.0, 8.0);
             s.spacing.button_padding = egui::vec2(12.0, 6.0);
         });
-        let settings_path = config_dir().join("settings.json");
-        let settings = Settings::load_from(&settings_path);
+        let smoke_dir = std::env::args().skip_while(|a| a != "--smoke").nth(1).map(PathBuf::from);
+        let settings_path = match &smoke_dir {
+            Some(d) => d.join("settings.json"), // never touch the user's real settings
+            None => config_dir().join("settings.json"),
+        };
+        let mut settings = Settings::load_from(&settings_path);
+        if let Some(d) = &smoke_dir {
+            let games = d.join("games").join("Demo");
+            let _ = std::fs::create_dir_all(&games);
+            let _ = std::fs::write(games.join("default.xbe"), ferrox_system::demo_xbe());
+            settings.library_folders = vec![d.join("games")];
+            settings.hdd_image = None;
+            settings.use_reference_cpu = !ferrox_system::hardware_virtualization(); // use the fast CPU wherever there is one
+        }
         let mut app = Self {
             settings,
             settings_path,
@@ -81,7 +104,9 @@ impl App {
             kvm: ferrox_system::hardware_virtualization(),
             hdd_gib: 8,
             hdd_note: None,
-            autolaunch: std::env::var_os("FERROX_AUTOLAUNCH").is_some(),
+            autolaunch: std::env::var_os("FERROX_AUTOLAUNCH").is_some() || smoke_dir.is_some(),
+            last_frame: None,
+            smoke: smoke_dir.map(|dir| Smoke { dir, started: std::time::Instant::now(), launched: false, opened_noted: false }),
         };
         app.tab = match std::env::var("FERROX_TAB").as_deref() {
             Ok("settings") => Tab::Settings,
@@ -149,6 +174,49 @@ impl App {
         self.tab = Tab::Play;
     }
 
+    fn smoke_step(&mut self, ctx: &egui::Context) {
+        let Some(sm) = &mut self.smoke else { return };
+        if !sm.opened_noted {
+            sm.opened_noted = true;
+            let _ = std::fs::write(
+                sm.dir.join("gui-smoke.txt"),
+                format!("ferrox gui smoke test, build {}\nwindow opened: yes\n(still running; this file is rewritten when the demo finishes)\n", env!("FERROX_BUILD")),
+            );
+        }
+        let finished = sm.launched && self.run.is_none();
+        let timed_out = sm.started.elapsed() > std::time::Duration::from_secs(30);
+        if !finished && !timed_out {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            return;
+        }
+        use ferrox_system::selftest::{check_demo_frame, check_demo_output, Status};
+        let mut text = format!("ferrox gui smoke test, build {}\nwindow opened: yes\n", env!("FERROX_BUILD"));
+        text.push_str(&format!("demo finished: {}\n", if finished { "yes" } else { "NO (timed out after 30 s)" }));
+        text.push_str(&format!("games found in the library: {}\n", self.games.len()));
+        text.push_str(&format!("status line: {}\n", self.status.0));
+        text.push_str(&format!("seconds from start: {:.1}\n", sm.started.elapsed().as_secs_f32()));
+        let mut bad = !finished;
+        match &self.last_frame {
+            Some(f) => {
+                text.push_str(&format!("picture shown: {}x{}\n", f.width, f.height));
+                let _ = std::fs::write(sm.dir.join("gui-frame.png"), f.to_png());
+                for c in check_demo_frame(f).into_iter().chain(check_demo_output(&self.console)) {
+                    if c.status == Status::Fail {
+                        bad = true;
+                        text.push_str(&format!("{}\n", c.line()));
+                    }
+                }
+            }
+            None => {
+                bad = true;
+                text.push_str("picture shown: NONE\n");
+            }
+        }
+        text.push_str(&format!("result: {}\n\n--- console ---\n{}\n", if bad { "PROBLEM (see above)" } else { "OK (picture and output are exactly as expected)" }, self.console));
+        let _ = std::fs::write(sm.dir.join("gui-smoke.txt"), text);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
     fn poll(&mut self, ctx: &egui::Context) {
         if let Some(rx) = &self.scan_rx {
             let mut disconnected = false;
@@ -178,6 +246,7 @@ impl App {
                 }
             }
             if let Some(f) = newest {
+                self.last_frame = Some(f.clone());
                 let img = egui::ColorImage::from_rgba_unmultiplied([f.width as usize, f.height as usize], &f.rgba);
                 match &mut self.picture {
                     Some(t) => t.set(img, egui::TextureOptions::LINEAR),
@@ -441,7 +510,11 @@ impl eframe::App for App {
             self.autolaunch = false;
             let g = self.games[0].clone();
             self.launch(ctx, &g);
+            if let Some(sm) = &mut self.smoke {
+                sm.launched = true;
+            }
         }
+        self.smoke_step(ctx);
         if self.scan_rx.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
