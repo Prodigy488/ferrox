@@ -15,15 +15,15 @@
 ## Layers
 
 ```
-ferrox-cli / (future) ferrox-app        front ends
+ferrox-cli / ferrox-app (GUI)           front ends
         |
-  machine assembly                       wires devices into a console
+  ferrox-system                          wires devices into a console, picks a backend
         |
  +------+---------+-----------+----------+
  | ferrox-machine | ferrox-nv2a | ferrox-hle | (future) apu, usb, ide, smbus, nvnet ...
  +----------------+-------------+
         |
-   ferrox-cpu  <--  backends: KVM, WHPX, HVF, reference interpreter
+   ferrox-cpu  <--  backends: ferrox-kvm (written), WHPX, HVF (planned), reference interpreter
         |
    ferrox-core   (Bus trait, errors)
 ```
@@ -71,7 +71,7 @@ PC. Known hazards, each with a plan:
 
 ## Testing strategy
 
-* Unit tests per crate (27 now). Parsers get truncation and corruption tests.
+* Unit tests per crate (50 now). Parsers get truncation and corruption tests.
 * Differential testing: use xemu as an oracle. Feed the same pushbuffer to both and
   compare register state or rendered frames.
 * Golden traces: record real games once, replay without the CPU.

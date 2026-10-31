@@ -48,9 +48,9 @@ changing the CPU, memory map or GPU.
 
 ## What is deliberately not done yet
 
-* The kernel export table is **not** filled in. The registry is data-driven so exports
-  are added as real games demand them, checked against a reliable reference, not
-  typed from memory.
+* Most kernel exports are not implemented. The table of names, ordinals and argument
+  sizes comes from the nxdk project (CC0), not memory; handlers are added as games
+  need them, and an unimplemented call stops the run with its name.
 * Direct3D is not replaced. In HLE mode the game's Direct3D calls become NV2A
   pushbuffers exactly as on hardware, so the GPU path is shared with LLE mode.
 * No claim is made about speed or compatibility until measured (see ROADMAP).
@@ -60,4 +60,5 @@ changing the CPU, memory map or GPU.
 * xboxdevwiki.net — Emulators page
 * gametechwiki.com — Xbox emulators page (compatibility figures, possibly stale)
 * Cxbx-Reloaded project README
+* nxdk — `lib/xboxkrnl/xboxkrnl.exe.def` (export list, CC0-1.0) and `lib/nxdk/format.c` (FATX formatting, MIT)
 * xemu project news (SDL3 migration, NV2A/APU updates, Vulkan backend changes)

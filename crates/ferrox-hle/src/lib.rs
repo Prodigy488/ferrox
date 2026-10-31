@@ -13,6 +13,10 @@
 //! copyrighted BIOS, so it is also the quickest way to run homebrew. Games
 //! that depend on exact kernel behaviour need the low-level mode instead.
 
+pub mod exports;
+pub mod kernel;
+
+use exports::Conv;
 use ferrox_core::{Bus, BusError};
 use ferrox_cpu::{CpuBackend, CpuError, Exit, Regs, ESP, HLE_PORT};
 use ferrox_formats::xbe::Xbe;
@@ -26,9 +30,32 @@ pub type Handler = Box<dyn FnMut(&mut Call) -> u32>;
 pub struct Call<'a> {
     pub regs: &'a mut Regs,
     pub bus: &'a mut dyn Bus,
+    /// Set to end the run (the guest asked to reboot, shut down or crashed).
+    pub stop: bool,
 }
 
 impl Call<'_> {
+    pub fn read_u32(&mut self, addr: u32) -> Result<u32, BusError> {
+        Ok(self.bus.read(addr as u64, 4)? as u32)
+    }
+
+    pub fn write_u32(&mut self, addr: u32, v: u32) -> Result<(), BusError> {
+        self.bus.write(addr as u64, 4, v as u64)
+    }
+
+    /// Reads a NUL-terminated string of at most `max` bytes.
+    pub fn read_cstr(&mut self, addr: u32, max: usize) -> Result<Vec<u8>, BusError> {
+        let mut out = Vec::new();
+        for i in 0..max as u32 {
+            let b = self.bus.read(addr.wrapping_add(i) as u64, 1)? as u8;
+            if b == 0 {
+                break;
+            }
+            out.push(b);
+        }
+        Ok(out)
+    }
+
     /// The `i`th 32-bit stack argument (stdcall: arg 0 is just above the
     /// return address).
     pub fn arg(&mut self, i: u32) -> Result<u32, BusError> {
@@ -39,9 +66,24 @@ impl Call<'_> {
 
 struct Export {
     name: &'static str,
-    argc: u32,
-    handler: Handler,
+    /// Bytes the stub pops on return (stdcall / fastcall stack arguments).
+    pop_bytes: u32,
+    data: bool,
+    handler: Option<Handler>,
 }
+
+/// Where the loader puts the things it creates in guest RAM.
+#[derive(Clone, Copy, Debug)]
+pub struct Layout {
+    /// Start of the area for call stubs (a few bytes per import).
+    pub stub_base: u32,
+    /// Start of the area for exported data objects (`DATA_SLOT` bytes each).
+    pub data_base: u32,
+    pub stack_top: u32,
+}
+
+/// Bytes reserved for each exported data object such as `KeTickCount`.
+pub const DATA_SLOT: u32 = 64;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum HleError {
@@ -52,7 +94,7 @@ pub enum HleError {
     Bus(BusError),
     Cpu(String),
     /// The game called an export with no handler.
-    UnimplementedCall { ordinal: u32 },
+    UnimplementedCall { ordinal: u32, name: &'static str },
 }
 
 impl std::fmt::Display for HleError {
@@ -62,8 +104,8 @@ impl std::fmt::Display for HleError {
             HleError::BadImage(m) => write!(f, "cannot load the executable: {m}"),
             HleError::Bus(e) => write!(f, "{e}"),
             HleError::Cpu(e) => write!(f, "{e}"),
-            HleError::UnimplementedCall { ordinal } => {
-                write!(f, "game called kernel export #{ordinal}, which has no handler")
+            HleError::UnimplementedCall { ordinal, name } => {
+                write!(f, "game called kernel export #{ordinal} ({name}), which is not implemented yet")
             }
         }
     }
@@ -96,8 +138,34 @@ impl KernelHle {
         Self::default()
     }
 
-    /// Registers a kernel export: its ordinal, name, number of 32-bit stack
-    /// arguments (the stub pops them on return, as stdcall requires), and the
+    /// Every export in the table, none implemented. Calling one that has no
+    /// handler stops the run with its name, which tells you what to write next.
+    pub fn with_table() -> Self {
+        let mut k = Self::new();
+        for e in exports::EXPORTS {
+            let pop_bytes = match e.conv {
+                Conv::Std => e.arg_bytes,
+                Conv::Fast => e.arg_bytes.saturating_sub(8),
+                Conv::Cdecl | Conv::Data => 0,
+            };
+            k.exports.insert(
+                e.ordinal,
+                Export { name: e.name, pop_bytes, data: e.conv == Conv::Data, handler: None },
+            );
+        }
+        k
+    }
+
+    /// Implements the table entry called `name`. Panics if there is no such
+    /// export: that is a typo in the emulator, not a runtime condition.
+    pub fn handle(&mut self, name: &str, handler: impl FnMut(&mut Call) -> u32 + 'static) {
+        let info = exports::by_name(name).unwrap_or_else(|| panic!("no kernel export named {name}"));
+        let e = self.exports.get_mut(&info.ordinal).expect("table registered by with_table");
+        e.handler = Some(Box::new(handler));
+    }
+
+    /// Registers a custom export (tests, or experiments outside the table):
+    /// ordinal, name, number of 32-bit stack arguments the stub pops, and the
     /// host function that implements it.
     pub fn register(
         &mut self,
@@ -106,7 +174,23 @@ impl KernelHle {
         argc: u32,
         handler: impl FnMut(&mut Call) -> u32 + 'static,
     ) {
-        self.exports.insert(ordinal, Export { name, argc, handler: Box::new(handler) });
+        self.exports.insert(
+            ordinal,
+            Export { name, pop_bytes: 4 * argc, data: false, handler: Some(Box::new(handler)) },
+        );
+    }
+
+    /// (functions with a handler, functions in the table).
+    pub fn coverage(&self) -> (usize, usize) {
+        let done = self.exports.values().filter(|e| e.handler.is_some() && !e.data).count();
+        let total = self.exports.values().filter(|e| !e.data).count();
+        (done, total)
+    }
+
+    pub fn is_implemented(&self, name: &str) -> bool {
+        exports::by_name(name)
+            .and_then(|i| self.exports.get(&i.ordinal))
+            .is_some_and(|e| e.handler.is_some())
     }
 
     pub fn name_of(&self, ordinal: u32) -> Option<&'static str> {
@@ -120,8 +204,7 @@ impl KernelHle {
         mem: &mut PhysMem,
         xbe: &Xbe,
         file: &[u8],
-        stub_base: u32,
-        stack_top: u32,
+        layout: Layout,
     ) -> Result<Loaded, HleError> {
         // headers, then each section's raw data (the rest of a section is zero)
         let hdr_end = (xbe.size_of_headers as usize).min(file.len());
@@ -138,29 +221,36 @@ impl KernelHle {
             .kernel_imports(file)
             .map_err(|_| HleError::BadImage("kernel import table unreadable"))?;
         let mut stubs = Vec::new();
-        let mut at = stub_base;
+        let mut at = layout.stub_base;
+        let mut data_at = layout.data_base;
         for (i, &ord) in ordinals.iter().enumerate() {
             let ex = self.exports.get(&ord).ok_or(HleError::MissingExport(ord))?;
-            // mov eax, ordinal ; out HLE_PORT, eax ; ret 4*argc
-            let mut code = vec![0xB8];
-            code.extend_from_slice(&ord.to_le_bytes());
-            code.extend_from_slice(&[0xE7, HLE_PORT as u8]);
-            if ex.argc == 0 {
-                code.push(0xC3);
+            let target = if ex.data {
+                // a zeroed object in guest RAM; the game reads and writes it directly
+                mem.load(data_at as u64, &[0u8; DATA_SLOT as usize])?;
+                let t = data_at;
+                data_at += DATA_SLOT;
+                t
             } else {
-                code.push(0xC2);
-                code.extend_from_slice(&((4 * ex.argc) as u16).to_le_bytes());
-            }
-            mem.load(at as u64, &code)?;
-            stubs.push((ord, at));
-            let slot = xbe
-                .va_to_file_offset(xbe.kernel_thunk_addr)
-                .ok_or(HleError::BadImage("thunk table address"))?;
-            let _ = slot; // the table lives in guest RAM now: patch it there
-            mem.write(xbe.kernel_thunk_addr as u64 + 4 * i as u64, 4, at as u64)?;
-            at += code.len().next_multiple_of(4) as u32;
+                // mov eax, ordinal ; out HLE_PORT, eax ; ret [pop_bytes]
+                let mut code = vec![0xB8];
+                code.extend_from_slice(&ord.to_le_bytes());
+                code.extend_from_slice(&[0xE7, HLE_PORT as u8]);
+                if ex.pop_bytes == 0 {
+                    code.push(0xC3);
+                } else {
+                    code.push(0xC2);
+                    code.extend_from_slice(&(ex.pop_bytes as u16).to_le_bytes());
+                }
+                mem.load(at as u64, &code)?;
+                let t = at;
+                at += code.len().next_multiple_of(4) as u32;
+                t
+            };
+            stubs.push((ord, target));
+            mem.write(xbe.kernel_thunk_addr as u64 + 4 * i as u64, 4, target as u64)?;
         }
-        Ok(Loaded { entry: xbe.entry_point, stack_top, stubs })
+        Ok(Loaded { entry: xbe.entry_point, stack_top: layout.stack_top, stubs })
     }
 
     /// Runs the guest, serving kernel calls, until it halts or `budget`
@@ -179,11 +269,20 @@ impl KernelHle {
                     let ex = self
                         .exports
                         .get_mut(&ordinal)
-                        .ok_or(HleError::UnimplementedCall { ordinal })?;
+                        .ok_or(HleError::UnimplementedCall { ordinal, name: "?" })?;
+                    let handler = ex
+                        .handler
+                        .as_mut()
+                        .ok_or(HleError::UnimplementedCall { ordinal, name: ex.name })?;
                     let mut regs = cpu.regs();
-                    let result = (ex.handler)(&mut Call { regs: &mut regs, bus });
+                    let mut call = Call { regs: &mut regs, bus, stop: false };
+                    let result = handler(&mut call);
+                    let stop = call.stop;
                     regs.gpr[0] = result;
                     cpu.set_regs(regs);
+                    if stop {
+                        return Ok(Exit::Halt);
+                    }
                     budget -= 1;
                 }
                 Exit::Budget => budget -= n,
@@ -205,6 +304,7 @@ mod tests {
     const ORD_ADD: u32 = 100;
     const ORD_LOG: u32 = 101;
     const RESULT: u32 = 0x2_0000;
+    const LAYOUT: Layout = Layout { stub_base: 0x30_0000, data_base: 0x31_0000, stack_top: 0x40_0000 - 16 };
 
     fn machine() -> PhysMem {
         let mut m = PhysMem::new();
@@ -244,7 +344,7 @@ mod tests {
             0
         });
         let mut mem = machine();
-        let loaded = hle.load(&mut mem, &xbe, &file, 0x30_0000, 0x40_0000 - 16).unwrap();
+        let loaded = hle.load(&mut mem, &xbe, &file, LAYOUT).unwrap();
         (mem, hle, loaded, logged)
     }
 
@@ -275,7 +375,7 @@ mod tests {
         hle.register(ORD_ADD, "TestAdd", 2, |_| 0);
         let mut mem = machine();
         assert_eq!(
-            hle.load(&mut mem, &xbe, &file, 0x30_0000, 0x40_0000).unwrap_err(),
+            hle.load(&mut mem, &xbe, &file, LAYOUT).unwrap_err(),
             HleError::MissingExport(999)
         );
     }
@@ -283,14 +383,14 @@ mod tests {
     #[test]
     fn calls_without_handlers_stop_the_run() {
         let (mut mem, mut hle, loaded, _) = setup();
-        hle.exports.remove(&ORD_ADD);
+        hle.exports.get_mut(&ORD_ADD).unwrap().handler = None;
         let mut cpu = RefCpu::new(loaded.entry);
         let mut r = cpu.regs();
         r.gpr[ESP] = loaded.stack_top;
         cpu.set_regs(r);
         assert_eq!(
             hle.run(&mut cpu, &mut mem, 10_000).unwrap_err(),
-            HleError::UnimplementedCall { ordinal: ORD_ADD }
+            HleError::UnimplementedCall { ordinal: ORD_ADD, name: "TestAdd" }
         );
     }
 

@@ -213,8 +213,8 @@ pub fn cmp_names(a: &str, b: &str) -> std::cmp::Ordering {
     a.chars().map(up).cmp(b.chars().map(up))
 }
 
-#[cfg(test)]
-pub(crate) mod testutil {
+#[doc(hidden)]
+pub mod testutil {
     //! A tiny XISO writer for tests (balanced trees, files after tables).
     use super::*;
 

@@ -42,6 +42,8 @@ pub enum CpuError {
     Bus(BusError),
     /// The backend does not implement this opcode.
     Unimplemented { eip: u32, opcode: u8 },
+    /// A hypervisor backend failed (bad VM exit, triple fault, ioctl error).
+    Backend(String),
 }
 
 impl From<BusError> for CpuError {
@@ -54,6 +56,7 @@ impl std::fmt::Display for CpuError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CpuError::Bus(e) => write!(f, "{e}"),
+            CpuError::Backend(m) => write!(f, "{m}"),
             CpuError::Unimplemented { eip, opcode } => {
                 write!(f, "opcode {opcode:#04x} at {eip:#x} is not implemented")
             }
@@ -72,7 +75,7 @@ pub trait CpuBackend {
 }
 
 /// The test interpreter: nop, mov r32 imm32, mov eax/[abs32], inc/dec r32,
-/// add eax imm32, jmp/jne rel8, push imm32, call [abs32], ret / ret imm16,
+/// add eax imm32, jmp/jne rel8, push imm32, add r32 imm8, call [abs32], ret / ret imm16,
 /// in/out (8-bit imm8 and dx forms; `out imm8, eax` for the hypercall port), hlt.
 #[derive(Default)]
 pub struct RefCpu {
@@ -180,6 +183,18 @@ impl CpuBackend for RefCpu {
                 0xEE => {
                     let p = self.regs.gpr[EDX] as u16;
                     bus.io_out(p, 1, (self.regs.gpr[EAX] & 0xff) as u64);
+                }
+                0x83 => {
+                    // add r32, imm8 (sign-extended), register form only
+                    let modrm = self.fetch8(bus)?;
+                    if modrm & 0xF8 != 0xC0 {
+                        return Err(CpuError::Unimplemented { eip: at, opcode: op });
+                    }
+                    let imm = self.fetch8(bus)? as i8 as i32 as u32;
+                    let r = &mut self.regs.gpr[(modrm & 7) as usize];
+                    *r = r.wrapping_add(imm);
+                    let v = *r;
+                    self.set_zf(v);
                 }
                 0x68 => {
                     let v = self.fetch32(bus)?;

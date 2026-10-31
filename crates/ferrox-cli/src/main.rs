@@ -11,7 +11,52 @@ usage:
   ferrox info <file.xbe|file.iso>       describe an executable or disc image
   ferrox ls <file.iso>                  list the files on a disc image
   ferrox pushbuffer <file> [get] [put]  decode a raw NV2A pushbuffer dump
-                                        (get/put are hex byte offsets)";
+                                        (get/put are hex byte offsets)
+  ferrox run <file.xbe|file.iso> [--hdd image] [--reference-cpu]
+                                        run a game with no BIOS (needs KVM on Linux)
+  ferrox hdd <new-image> [GiB]          create a formatted blank hard-drive image
+  ferrox demo <folder>                  write a tiny demo game into <folder>/Demo";
+
+fn run_cmd(args: &[String]) -> Result<(), String> {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    let path = args.first().ok_or("run needs a file")?;
+    let mut cfg = ferrox_system::Config {
+        source: ferrox_system::Source::from_path(std::path::Path::new(path)),
+        backend: ferrox_system::Backend::Auto,
+        hdd: None,
+    };
+    let mut it = args[1..].iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--hdd" => cfg.hdd = Some(it.next().ok_or("--hdd needs a path")?.into()),
+            "--reference-cpu" => cfg.backend = ferrox_system::Backend::Reference,
+            other => return Err(format!("unknown option {other}")),
+        }
+    }
+    let rep = ferrox_system::run(&cfg, &Arc::new(AtomicBool::new(false)), |s| print!("{s}"))?;
+    eprintln!("[{}] {:?} on {}", rep.title, rep.outcome, rep.backend);
+    Ok(())
+}
+
+fn hdd_cmd(args: &[String]) -> Result<(), String> {
+    let path = args.first().ok_or("hdd needs an output path")?;
+    let gib: u64 = match args.get(1) {
+        Some(g) => g.parse().map_err(|_| "size must be a whole number of GiB".to_string())?,
+        None => 8,
+    };
+    ferrox_formats::hdd::create_image(std::path::Path::new(path), gib << 30).map_err(|e| e.to_string())?;
+    println!("created {path} ({gib} GiB, sparse)");
+    Ok(())
+}
+
+fn demo_cmd(args: &[String]) -> Result<(), String> {
+    let root = std::path::Path::new(args.first().ok_or("demo needs a folder")?).join("Demo");
+    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    std::fs::write(root.join("default.xbe"), ferrox_system::demo_xbe()).map_err(|e| e.to_string())?;
+    println!("wrote {}", root.join("default.xbe").display());
+    Ok(())
+}
 
 fn region_name(r: u32) -> String {
     match r & 7 {
@@ -129,6 +174,9 @@ fn main() -> ExitCode {
         Some("ls") => args.get(1).ok_or("ls needs a file".to_string())
             .and_then(|p| ls(p).map_err(|e| e.to_string())),
         Some("pushbuffer") => pushbuffer(&args[1..]),
+        Some("run") => run_cmd(&args[1..]),
+        Some("hdd") => hdd_cmd(&args[1..]),
+        Some("demo") => demo_cmd(&args[1..]),
         _ => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;

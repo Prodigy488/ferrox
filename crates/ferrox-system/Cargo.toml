@@ -1,0 +1,17 @@
+[package]
+name = "ferrox-system"
+description = "Machine assembly: loads a game, picks a CPU backend, runs it, reports what happened"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ferrox-core = { path = "../ferrox-core" }
+ferrox-cpu = { path = "../ferrox-cpu" }
+ferrox-formats = { path = "../ferrox-formats" }
+ferrox-hle = { path = "../ferrox-hle" }
+ferrox-machine = { path = "../ferrox-machine" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ferrox-kvm = { path = "../ferrox-kvm" }

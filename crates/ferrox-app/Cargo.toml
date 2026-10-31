@@ -1,0 +1,23 @@
+[package]
+name = "ferrox-app"
+description = "Desktop front end for ferrox: game library, settings, hard-drive images, console"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "ferrox_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ferrox-gui"
+path = "src/main.rs"
+
+[dependencies]
+ferrox-formats = { path = "../ferrox-formats" }
+ferrox-system = { path = "../ferrox-system" }
+eframe = { version = "0.31", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

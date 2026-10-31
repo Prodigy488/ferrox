@@ -8,10 +8,18 @@ easiest. Each milestone ends with something you can run.
 Disc and executable readers, physical memory map, CPU backend interface, pushbuffer
 decoder, CLI, tests.
 
-## M0.5 — High-level kernel groundwork (done)
-`ferrox-hle`: XBE loader, kernel-import stubs, host-side export registry, run loop,
-tested end to end on the reference interpreter with a synthetic executable.
-Exports are registered as needed; none of the real table is claimed yet.
+## M0.5 — High-level kernel groundwork and app shell (done)
+`ferrox-hle` (loader, stubs, 337-function export table from nxdk, 22 handlers),
+`ferrox-kvm` (written, awaiting a KVM host), `ferrox-system`, the desktop app, blank
+hard-drive images, CLI `run`/`hdd`/`demo`.
+
+**Next, in order:**
+1. Run `cargo test -p ferrox-kvm -- --ignored` on a KVM machine and fix what it finds.
+2. Kernel: threads and scheduling, events/semaphores/mutexes, DPCs and interrupts,
+   file access (`NtCreateFile` and friends over the disc image and FATX drive E:).
+3. A homebrew program built with nxdk that only uses text output runs end to end.
+4. Then M3/M4 below (GPU) — nothing draws until then.
+5. WHPX (Windows) and HVF (macOS) backends; qcow2 reading for xemu-made images.
 
 ## M1 — Run guest code
 * A real CPU backend: KVM first (Linux), then WHPX and HVF.

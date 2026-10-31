@@ -2,6 +2,7 @@
 //! and XBE executables. No dependencies, no unsafe, and every field is bounds
 //! checked so a damaged or hostile file produces an error, never a panic.
 
+pub mod hdd;
 pub mod xbe;
 pub mod xdvdfs;
 

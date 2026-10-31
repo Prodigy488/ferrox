@@ -5,35 +5,50 @@ the things xemu's architecture makes hard: hardware-virtualized CPU execution,
 a Vulkan-first renderer, small testable device crates, and modern player
 features.
 
-**Status: foundation only. ferrox does not run games yet.** What exists today
-is the groundwork that everything else sits on, with tests:
+**Status: early. ferrox can run a small program's own code with the kernel
+provided in software, and has a desktop app, but it cannot run commercial games:
+there is no graphics, audio, input or file access yet.** Everything below has
+tests, except where it says otherwise.
 
 | Crate | What it does | State |
 |---|---|---|
-| `ferrox-formats` | XDVDFS (XISO) disc reader, XBE executable parser | working, tested; XDVDFS also checked against an image made by `extract-xiso` |
-| `ferrox-machine` | Physical address space: RAM, mirrored BIOS ROM, MMIO and port devices | working, tested |
-| `ferrox-cpu` | CPU backend interface + a tiny reference interpreter for tests | interface done; **no real CPU backend yet** |
-| `ferrox-hle` | High-level kernel mode: loads an XBE, stubs the kernel imports, serves calls from the host | working on the reference interpreter; export table intentionally empty |
+| `ferrox-formats` | XDVDFS (XISO) disc reader, XBE parser, blank FATX hard-drive image creator | working, tested; XDVDFS checked against an image made by `extract-xiso` |
+| `ferrox-machine` | Physical address space: RAM, mirrored ROM, MMIO and port devices | working, tested |
+| `ferrox-cpu` | CPU backend interface + a tiny test interpreter | done |
+| `ferrox-kvm` | Linux KVM backend: guest runs natively, only I/O and kernel calls exit | **compiles; never run** (no KVM on the dev machine). One ignored test awaits a KVM host |
+| `ferrox-hle` | No-BIOS kernel: loads an XBE, patches its imports, answers kernel calls | 22 of 337 kernel functions implemented; the rest stop the run and name themselves |
+| `ferrox-system` | Assembles a machine, picks a CPU backend, runs a game | working with the test interpreter; KVM path untested |
 | `ferrox-nv2a` | GPU command-stream (pushbuffer) decoder | working, tested against xemu's `pfifo.c` rules |
-| `ferrox-cli` | `ferrox info`, `ferrox ls`, `ferrox pushbuffer` | working |
+| `ferrox-app` | Desktop app `ferrox-gui`: library, play/console, settings, hard-drive creator | working; screenshots checked on a virtual display; no video yet |
+| `ferrox-cli` | `info`, `ls`, `pushbuffer`, `run`, `hdd`, `demo` | working |
 
 ```
 cargo test --workspace
+cargo run --release -p ferrox-app --bin ferrox-gui     # the desktop app
+cargo run -p ferrox-cli -- demo ./games                # writes a tiny demo program
+cargo run -p ferrox-cli -- run ./games/Demo/default.xbe --reference-cpu
 cargo run -p ferrox-cli -- ls game.iso
-cargo run -p ferrox-cli -- info default.xbe
 ```
+
+(On Linux the app needs OpenGL and, for `run` without `--reference-cpu`, `/dev/kvm`.)
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design and
 [docs/ROADMAP.md](docs/ROADMAP.md) for what comes next and why.
 
-## You will need your own BIOS
+## BIOS and hard drive
 
-Like every Xbox emulator, ferrox needs a dump of an MCPX boot ROM, a BIOS and a
-hard-disk image from a console you own. They are not included and must not be
-shared.
+* **No-BIOS mode (the one that exists):** ferrox loads the game directly and
+  provides the console's kernel itself. No copyrighted files are needed.
+* **BIOS mode (planned):** boots the console's own firmware; you would supply your
+  own boot ROM and BIOS from a console you own. They are never included.
+* **Hard drive:** `ferrox hdd xbox_hdd.img 8` (or Settings → Create) makes a blank,
+  formatted, sparse image with the console's standard partitions. Games cannot use
+  it yet: the kernel's file functions are not written.
 
 ## License
 
 GPL-2.0-or-later (see `LICENSE`). Behaviour is cross-checked against
 [xemu](https://github.com/xemu-project/xemu) (GPL-2.0), which is why ferrox uses
-the same license. ferrox is not affiliated with xemu or Microsoft.
+the same license. The kernel export list comes from
+[nxdk](https://github.com/XboxDev/nxdk) (CC0-1.0); the FATX format logic follows
+nxdk's formatter (MIT). ferrox is not affiliated with xemu or Microsoft.

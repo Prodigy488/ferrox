@@ -8,6 +8,7 @@ repository.workspace = true
 [dependencies]
 ferrox-formats = { path = "../ferrox-formats" }
 ferrox-nv2a = { path = "../ferrox-nv2a" }
+ferrox-system = { path = "../ferrox-system" }
 
 [[bin]]
 name = "ferrox"

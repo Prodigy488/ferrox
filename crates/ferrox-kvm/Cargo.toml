@@ -1,0 +1,17 @@
+[package]
+name = "ferrox-kvm"
+description = "Linux KVM backend: runs the guest CPU at native speed under hardware virtualization"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ferrox-core = { path = "../ferrox-core" }
+ferrox-cpu = { path = "../ferrox-cpu" }
+ferrox-machine = { path = "../ferrox-machine" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+kvm-ioctls = "0.25"
+kvm-bindings = "0.14"
+libc = "0.2"

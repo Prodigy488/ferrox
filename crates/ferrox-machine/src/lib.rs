@@ -69,6 +69,18 @@ impl std::fmt::Display for MapError {
 
 impl std::error::Error for MapError {}
 
+/// A span of guest memory backed by host memory, for hypervisor backends that
+/// map it into the VM so the guest accesses it at full speed.
+#[derive(Clone, Copy, Debug)]
+pub struct MemSlot {
+    pub guest_addr: u64,
+    pub size: u64,
+    /// Start of the host bytes. Valid while the `PhysMem` it came from lives
+    /// and is not mutated through `Bus` at the same time the guest runs.
+    pub host_ptr: *mut u8,
+    pub read_only: bool,
+}
+
 #[derive(Default)]
 pub struct PhysMem {
     /// Sorted by base, never overlapping.
@@ -99,6 +111,30 @@ impl PhysMem {
         }
         self.regions.insert(at, Region { base, size, backing });
         Ok(())
+    }
+
+    /// RAM and ROM regions as host memory spans. MMIO regions are absent: a
+    /// hypervisor reports guest accesses to them as exits, which the machine
+    /// serves through `Bus`.
+    pub fn mem_slots(&mut self) -> Vec<MemSlot> {
+        self.regions
+            .iter_mut()
+            .filter_map(|r| match &mut r.backing {
+                Backing::Ram(v) => Some(MemSlot {
+                    guest_addr: r.base,
+                    size: r.size,
+                    host_ptr: v.as_mut_ptr(),
+                    read_only: false,
+                }),
+                Backing::Rom(v) => Some(MemSlot {
+                    guest_addr: r.base,
+                    size: r.size,
+                    host_ptr: v.as_ptr() as *mut u8,
+                    read_only: true,
+                }),
+                Backing::Mmio(_) => None,
+            })
+            .collect()
     }
 
     pub fn add_ram(&mut self, base: u64, size: usize) -> Result<(), MapError> {
@@ -216,6 +252,28 @@ impl Bus for PhysMem {
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod slot_tests {
+    use super::*;
+
+    #[test]
+    fn slots_list_ram_and_rom_but_not_mmio() {
+        struct Dev;
+        impl Mmio for Dev {
+            fn read(&mut self, _: u64, _: usize) -> u64 { 0 }
+            fn write(&mut self, _: u64, _: usize, _: u64) {}
+        }
+        let mut m = PhysMem::new();
+        m.add_ram(0, 4096).unwrap();
+        m.add_mmio(0x1000_0000, 4096, Box::new(Dev)).unwrap();
+        m.add_rom_mirrored(0x2000, vec![1; 0x1000]).unwrap();
+        let slots = m.mem_slots();
+        assert_eq!(slots.len(), 3);
+        assert!(!slots[0].read_only && slots[1..].iter().all(|s| s.read_only));
+        assert_eq!(slots[1].host_ptr, slots[2].host_ptr, "mirrors share bytes");
     }
 }
 
