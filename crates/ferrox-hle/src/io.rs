@@ -198,6 +198,62 @@ impl Volume for HostVolume {
     }
 }
 
+// ---------------------------------------------------------------- the raw disk ----
+
+/// The whole hard disk as one big file of sectors: unwritten sectors read as zeros, writes are
+/// kept for the run. Games read the disk's configuration sectors through it.
+#[derive(Default)]
+pub struct RawDisk {
+    sectors: HashMap<u64, [u8; 512]>,
+}
+
+/// 8 GiB: the size reported for the raw disk.
+const RAW_DISK_BYTES: u64 = 8 << 30;
+
+impl Volume for RawDisk {
+    fn stat(&mut self, path: &str) -> Option<Stat> {
+        path.is_empty().then(|| Stat { name: String::new(), is_dir: false, size: RAW_DISK_BYTES })
+    }
+
+    fn read(&mut self, path: &str, offset: u64, len: usize) -> IoResult<Vec<u8>> {
+        if !path.is_empty() {
+            return Err(STATUS_NAME_NOT_FOUND);
+        }
+        let n = clamp_read(RAW_DISK_BYTES, offset, len)?;
+        let mut out = vec![0u8; n];
+        for (i, b) in out.iter_mut().enumerate() {
+            let at = offset + i as u64;
+            if let Some(s) = self.sectors.get(&(at / 512)) {
+                *b = s[(at % 512) as usize];
+            }
+        }
+        Ok(out)
+    }
+
+    fn list(&mut self, _path: &str) -> Option<Vec<Stat>> {
+        None
+    }
+
+    fn writable(&self) -> bool {
+        true
+    }
+
+    fn write(&mut self, path: &str, offset: u64, data: &[u8]) -> IoResult<()> {
+        if !path.is_empty() {
+            return Err(STATUS_NAME_NOT_FOUND);
+        }
+        for (i, &b) in data.iter().enumerate() {
+            let at = offset + i as u64;
+            self.sectors.entry(at / 512).or_insert([0; 512])[(at % 512) as usize] = b;
+        }
+        Ok(())
+    }
+
+    fn set_len(&mut self, _path: &str, _len: u64) -> IoResult<()> {
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------- memory only ----
 
 struct Node {
@@ -362,7 +418,7 @@ impl Files {
             f.links.insert(format!("\\??\\{letter}:"), dev);
         }
         // the whole disk as one device: opened for geometry and raw access
-        f.devices.push(("\\device\\harddisk0\\partition0".into(), Box::new(MemVolume::new())));
+        f.devices.push(("\\device\\harddisk0\\partition0".into(), Box::new(RawDisk::default())));
         f.links.insert("\\??\\d:".into(), "\\device\\cdrom0".into());
         f.links.insert("\\??\\cdrom0:".into(), "\\device\\cdrom0".into());
         f
@@ -955,6 +1011,16 @@ fn open_link(c: &mut Call, f: &Rc<RefCell<Files>>, out: u32, name: &str) -> u32 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_raw_disk_reads_zeros_and_keeps_writes() {
+        let mut d = RawDisk::default();
+        assert_eq!(d.read("", 4096, 512).unwrap(), vec![0; 512]);
+        d.write("", 510, &[1, 2, 3, 4]).unwrap();
+        assert_eq!(d.read("", 508, 8).unwrap(), vec![0, 0, 1, 2, 3, 4, 0, 0]);
+        assert_eq!(d.stat("").unwrap().size, 8 << 30);
+        assert!(d.read("", 8 << 30, 512).is_err());
+    }
 
     fn files() -> Files {
         let mut f = Files::new(0x4D53_0004);

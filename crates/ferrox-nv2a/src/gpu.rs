@@ -32,6 +32,10 @@ pub const CACHE1_DMA_CTL: u32 = 0x3230;
 pub const CACHE1_DMA_PUT: u32 = 0x3240;
 pub const CACHE1_DMA_GET: u32 = 0x3244;
 pub const CACHE1_PULL0: u32 = 0x3250;
+/// Both report the command queue as empty (bit 4): commands run the moment they are submitted.
+pub const PFIFO_RUNOUT_STATUS: u32 = 0x2400;
+pub const CACHE1_STATUS: u32 = 0x3214;
+const QUEUE_EMPTY: u32 = 1 << 4;
 
 pub fn is_pfifo(off: u32) -> bool {
     (0x2000..0x4000).contains(&off)
@@ -42,7 +46,7 @@ fn known_pfifo(off: u32) -> bool {
         off,
         PFIFO_INTR_0 | PFIFO_INTR_EN_0 | PFIFO_RAMHT | CACHE1_PUSH0 | CACHE1_PUSH1 | CACHE1_DMA_PUSH
             | CACHE1_DMA_STATE | CACHE1_DMA_INSTANCE | CACHE1_DMA_CTL | CACHE1_DMA_PUT | CACHE1_DMA_GET
-            | CACHE1_PULL0
+            | CACHE1_PULL0 | PFIFO_RUNOUT_STATUS | CACHE1_STATUS
     )
 }
 
@@ -244,6 +248,7 @@ impl Gpu {
         match off {
             CACHE1_DMA_PUT => self.dma_put,
             CACHE1_DMA_GET => self.dma_get,
+            PFIFO_RUNOUT_STATUS | CACHE1_STATUS => QUEUE_EMPTY,
             CACHE1_DMA_CTL => self.reg(off) | 0x8000_0000, // no cached translation: always valid
             _ => {
                 if !known_pfifo(off) {
@@ -968,6 +973,13 @@ mod tests {
         let (mut gpu, shared) = Nv2a::new();
         gpu.attach_ram(mem.ram_view(0).unwrap());
         (gpu, shared, mem)
+    }
+
+    #[test]
+    fn the_command_queue_reads_as_empty() {
+        let (mut g, _, _) = setup();
+        assert_eq!(g.read(CACHE1_STATUS as u64, 4) & 0x10, 0x10);
+        assert_eq!(g.read(PFIFO_RUNOUT_STATUS as u64, 4) & 0x10, 0x10);
     }
 
     #[test]

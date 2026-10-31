@@ -334,6 +334,27 @@ pub fn install(hle: &mut KernelHle, st: Rc<RefCell<KernelState>>) {
         put(c, out, h);
         STATUS_SUCCESS
     });
+    hle.handle("NtSetTimerEx", |c| {
+        // (Timer, DueTime*, ApcRoutine, ProcessorMode, ApcContext, Resume, Period ms, PreviousState*)
+        // timer completion routines (APCs) are not delivered yet; the timer itself signals
+        let (h, due_ptr, period, prev) = (arg(c, 0), arg(c, 1), arg(c, 6), arg(c, 7));
+        let Some(o) = object(c, h) else { return STATUS_INVALID_HANDLE };
+        let raw = match (c.read_u32(due_ptr), c.read_u32(due_ptr.wrapping_add(4))) {
+            (Ok(lo), Ok(hi)) if due_ptr != 0 => Some(((hi as u64) << 32 | lo as u64) as i64),
+            _ => None,
+        };
+        let due = c.sched.deadline(raw).unwrap_or(0);
+        let was = c.sched.set_timer(c.bus, o, due, period, 0);
+        put(c, prev, was as u32);
+        STATUS_SUCCESS
+    });
+    hle.handle("NtCancelTimer", |c| {
+        let (h, prev) = (arg(c, 0), arg(c, 1));
+        let Some(o) = object(c, h) else { return STATUS_INVALID_HANDLE };
+        let was = c.sched.cancel_timer(o);
+        put(c, prev, was as u32);
+        STATUS_SUCCESS
+    });
     hle.handle("NtClose", |c| {
         let h = arg(c, 0);
         c.sched.close_handle(h);

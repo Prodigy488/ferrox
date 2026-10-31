@@ -145,6 +145,22 @@ pub fn install(hle: &mut KernelHle, heap: Range<u32>) -> Rc<RefCell<KernelState>
             s.borrow_mut().alloc(size, 16).unwrap_or(0)
         });
     }
+    let s = st.clone();
+    hle.handle("IoCreateDevice", move |c| {
+        // (DriverObject, DeviceExtensionSize, DeviceName, DeviceType, Exclusive, DeviceObject**)
+        let (ext, kind, out) = (c.arg(1).unwrap_or(0), c.arg(3).unwrap_or(0), c.arg(5).unwrap_or(0));
+        let Some(dev) = s.borrow_mut().alloc(0x30 + ext, 16) else { return STATUS_NO_MEMORY };
+        for i in (0..0x30 + ext).step_by(4) {
+            let _ = c.write_u32(dev + i, 0);
+        }
+        let _ = c.write_u32(dev, kind << 16 | 3); // Type 3 = device object, Size follows
+        let _ = c.write_u32(dev + 0x18, kind); // DeviceType
+        let _ = c.write_u32(dev + 0x2C, if ext != 0 { dev + 0x30 } else { 0 }); // DeviceExtension
+        if out != 0 {
+            let _ = c.write_u32(out, dev);
+        }
+        0
+    });
     hle.handle("ExFreePool", |_| 0);
     let s = st.clone();
     hle.handle("MmAllocateContiguousMemory", move |c| {
