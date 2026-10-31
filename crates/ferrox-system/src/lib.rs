@@ -410,6 +410,19 @@ pub fn run(
         files.borrow_mut().mount("\\Device\\CdRom0", disc);
     }
     io::install(&mut hle, files.clone());
+    // the display signals each picture's end 60 times a second; the driver's handler hears it
+    // on the GPU's interrupt line (bus level 3 -> vector 0x33)
+    {
+        let gpu = gpu_state.clone();
+        let mut next = 0u64;
+        hle.add_interrupt_source(0x33, move |now| {
+            if now >= next {
+                gpu.vblank();
+                next = now + 166_667;
+            }
+            gpu.irq_line()
+        });
+    }
     hle.set_lenient(cfg.probe.is_some());
     let loaded = hle.load(&mut mem, &xbe, &file, LAYOUT).map_err(|e| e.to_string())?;
     hle.start_scheduler(&mut mem, SCHED).map_err(|e| e.to_string())?;

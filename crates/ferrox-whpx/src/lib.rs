@@ -17,7 +17,7 @@
 #![cfg(windows)]
 
 use ferrox_core::Bus;
-use ferrox_cpu::{CpuBackend, CpuError, Exit, Regs, HLE_PORT};
+use ferrox_cpu::{CpuBackend, CpuError, Exit, Regs, FLAG_MASK, HLE_PORT};
 use ferrox_machine::MemSlot;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -322,15 +322,16 @@ impl WhpCpu {
         let names = [
             WHvX64RegisterCs, WHvX64RegisterDs, WHvX64RegisterEs, WHvX64RegisterFs,
             WHvX64RegisterGs, WHvX64RegisterSs, WHvX64RegisterGdtr, WHvX64RegisterCr0,
-            WHvX64RegisterRip, WHvX64RegisterRflags,
+            WHvX64RegisterRip, WHvX64RegisterRflags, WHvX64RegisterCr4,
         ];
         let values = [
             seg(CODE_SEL, code), seg(DATA_SEL, data), seg(DATA_SEL, data), seg(DATA_SEL, data),
             seg(DATA_SEL, data), seg(DATA_SEL, data),
             Val(WHV_REGISTER_VALUE { Table: gdtr }),
-            r64(0x11), // PE | ET, no paging
+            r64(0x33), // PE | MP | ET | NE, no paging, no x87/SSE emulation traps
             r64(entry as u64),
             r64(2),
+            r64(0x600), // OSFXSR | OSXMMEXCPT: the console's kernel turns SSE on before any game runs
         ];
         trace("setting initial registers");
         if let Err(e) = check(
@@ -471,6 +472,7 @@ impl CpuBackend for WhpCpu {
             gpr: std::array::from_fn(|i| g(i) as u32),
             eip: g(8) as u32,
             zf: g(9) & 0x40 != 0,
+            eflags: (g(9) as u32) & FLAG_MASK | 2,
         }
     }
 
@@ -496,7 +498,11 @@ impl CpuBackend for WhpCpu {
         let names: Vec<WHV_REGISTER_NAME> = GPRS.iter().copied().chain([WHvX64RegisterRip, WHvX64RegisterRflags]).collect();
         let mut vals: Vec<Val> = regs.gpr.iter().map(|&v| r64(v as u64)).collect();
         vals.push(r64(regs.eip as u64));
-        vals.push(r64((flags_now & !0x40) | if regs.zf { 0x40 } else { 0 }));
+        vals.push(r64(if regs.eflags != 0 {
+            (flags_now & !(FLAG_MASK as u64)) | (regs.eflags & FLAG_MASK) as u64 | 2
+        } else {
+            (flags_now & !0x40) | if regs.zf { 0x40 } else { 0 }
+        }));
         // SAFETY: names and vals have the same length.
         unsafe { (self.api.set_regs)(self.part, 0, names.as_ptr(), names.len() as u32, vals.as_ptr() as *const WHV_REGISTER_VALUE) };
     }

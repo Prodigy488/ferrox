@@ -361,6 +361,8 @@ impl Files {
             f.devices.push((dev.clone(), Box::new(v)));
             f.links.insert(format!("\\??\\{letter}:"), dev);
         }
+        // the whole disk as one device: opened for geometry and raw access
+        f.devices.push(("\\device\\harddisk0\\partition0".into(), Box::new(MemVolume::new())));
         f.links.insert("\\??\\d:".into(), "\\device\\cdrom0".into());
         f.links.insert("\\??\\cdrom0:".into(), "\\device\\cdrom0".into());
         f

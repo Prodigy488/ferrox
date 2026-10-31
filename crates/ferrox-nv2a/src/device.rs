@@ -36,6 +36,11 @@ pub const VGA_STATUS: u64 = 0x0060_13DA;
 pub struct Shared {
     /// Where the CRTC is scanning out from (0 until a program sets it).
     display_start: AtomicU32,
+    /// PMC_INTR_EN_0 (bit 0: hardware interrupts on), PCRTC_INTR_0 (bit 0: vertical blank
+    /// happened) and PCRTC_INTR_EN_0, shared so the host can raise the interrupt line.
+    pmc_intr_en: AtomicU32,
+    pcrtc_intr: AtomicU32,
+    pcrtc_intr_en: AtomicU32,
     unhandled: Mutex<BTreeMap<(bool, u32), u32>>,
     gaps: Mutex<BTreeMap<String, u32>>,
     log: Mutex<Vec<String>>,
@@ -45,6 +50,22 @@ pub struct Shared {
 }
 
 impl Shared {
+    /// The picture finished: sets the vertical-blank flag the driver's interrupt handler reads.
+    pub fn vblank(&self) {
+        self.pcrtc_intr.fetch_or(1, Ordering::Relaxed);
+    }
+
+    /// What PMC_INTR_0 reads: one bit per source with a pending, enabled interrupt.
+    pub fn pmc_pending(&self) -> u32 {
+        let crtc = self.pcrtc_intr.load(Ordering::Relaxed) & self.pcrtc_intr_en.load(Ordering::Relaxed);
+        if crtc != 0 { 1 << 24 } else { 0 }
+    }
+
+    /// Whether the chip is asking the processor for an interrupt right now.
+    pub fn irq_line(&self) -> bool {
+        self.pmc_intr_en.load(Ordering::Relaxed) & 1 != 0 && self.pmc_pending() != 0
+    }
+
     pub fn display_start(&self) -> Option<u32> {
         match self.display_start.load(Ordering::Relaxed) {
             0 => None,
@@ -107,9 +128,6 @@ impl Shared {
 
 pub struct Nv2a {
     shared: Arc<Shared>,
-    pmc_intr_en: u32,
-    pcrtc_intr_en: u32,
-    pcrtc_intr: u32,
     raster: u32,
     status_toggle: bool,
     gpu: Gpu,
@@ -120,9 +138,6 @@ impl Nv2a {
         let shared = Arc::new(Shared::default());
         let dev = Nv2a {
             shared: shared.clone(),
-            pmc_intr_en: 0,
-            pcrtc_intr_en: 0,
-            pcrtc_intr: 0,
             raster: 0,
             status_toggle: false,
             gpu: Gpu::new(shared.clone()),
@@ -153,10 +168,10 @@ impl Mmio for Nv2a {
         }
         match offset {
             PMC_BOOT_0 => BOOT_0_VALUE as u64,
-            PMC_INTR_0 => 0,
-            PMC_INTR_EN_0 => self.pmc_intr_en as u64,
-            PCRTC_INTR_0 => self.pcrtc_intr as u64,
-            PCRTC_INTR_EN_0 => self.pcrtc_intr_en as u64,
+            PMC_INTR_0 => self.shared.pmc_pending() as u64,
+            PMC_INTR_EN_0 => self.shared.pmc_intr_en.load(Ordering::Relaxed) as u64,
+            PCRTC_INTR_0 => self.shared.pcrtc_intr.load(Ordering::Relaxed) as u64,
+            PCRTC_INTR_EN_0 => self.shared.pcrtc_intr_en.load(Ordering::Relaxed) as u64,
             PCRTC_START => self.shared.display_start.load(Ordering::Relaxed) as u64,
             PCRTC_RASTER => {
                 self.raster = self.raster.wrapping_add(1);
@@ -187,9 +202,11 @@ impl Mmio for Nv2a {
             return self.gpu.pfifo_write(offset as u32, v);
         }
         match offset {
-            PMC_INTR_EN_0 => self.pmc_intr_en = v,
-            PCRTC_INTR_0 => self.pcrtc_intr &= !v, // write one to clear
-            PCRTC_INTR_EN_0 => self.pcrtc_intr_en = v,
+            PMC_INTR_EN_0 => self.shared.pmc_intr_en.store(v, Ordering::Relaxed),
+            PCRTC_INTR_0 => {
+                self.shared.pcrtc_intr.fetch_and(!v, Ordering::Relaxed); // write one to clear
+            }
+            PCRTC_INTR_EN_0 => self.shared.pcrtc_intr_en.store(v, Ordering::Relaxed),
             PCRTC_START => self.shared.display_start.store(v & 0x07FF_FFFF, Ordering::Relaxed),
             _ => self.shared.note(true, offset),
         }
@@ -219,13 +236,18 @@ mod tests {
 
     #[test]
     fn interrupt_enables_read_back_and_pending_bits_clear_on_write() {
-        let (mut d, _) = Nv2a::new();
+        let (mut d, shared) = Nv2a::new();
         d.write(PMC_INTR_EN_0, 4, 1);
         d.write(PCRTC_INTR_EN_0, 4, 1);
         assert_eq!((d.read(PMC_INTR_EN_0, 4), d.read(PCRTC_INTR_EN_0, 4)), (1, 1));
-        d.pcrtc_intr = 1;
+        shared.vblank();
+        assert_eq!(d.read(PCRTC_INTR_0, 4), 1);
+        assert!(shared.irq_line(), "enabled and pending");
+        assert_eq!(d.read(PMC_INTR_0, 4), 1 << 24, "the CRTC bit of the master register");
         d.write(PCRTC_INTR_0, 4, 1);
         assert_eq!(d.read(PCRTC_INTR_0, 4), 0);
+        assert!(!shared.irq_line());
+        assert_eq!(d.read(PMC_INTR_0, 4), 0);
     }
 
     #[test]

@@ -13,7 +13,14 @@ pub struct Regs {
     pub gpr: [u32; 8],
     pub eip: u32,
     pub zf: bool,
+    /// The arithmetic flags (CF PF AF ZF SF DF OF) as the hardware backends report them; zero
+    /// means "not captured" (the test interpreter keeps only `zf`). Saving and restoring the whole
+    /// value lets the host interrupt the guest between any two instructions.
+    pub eflags: u32,
 }
+
+/// The flags a saved context carries: CF PF AF ZF SF DF OF.
+pub const FLAG_MASK: u32 = 0xCD5;
 
 pub const EAX: usize = 0;
 pub const ECX: usize = 1;

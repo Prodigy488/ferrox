@@ -557,6 +557,10 @@ mod tests {
 
     /// Runs `asm` (entry at its start) and returns the memory afterwards.
     fn run(asm: Asm, extra: &[&'static str]) -> (PhysMem, KernelHle, Exit) {
+        run_with(asm, extra, |_| {})
+    }
+
+    fn run_with(asm: Asm, extra: &[&'static str], setup: impl FnOnce(&mut KernelHle)) -> (PhysMem, KernelHle, Exit) {
         let mut names = asm.names.clone();
         names.extend_from_slice(extra);
         let ords: Vec<u32> = names.iter().map(|n| ord(n)).collect();
@@ -565,6 +569,7 @@ mod tests {
         let xbe = Xbe::parse(&file).unwrap();
         let mut hle = KernelHle::with_table();
         kernel::install(&mut hle, 0x38_0000..0x3F_0000);
+        setup(&mut hle);
         let mut mem = PhysMem::new();
         mem.add_ram(0, 4 * 1024 * 1024).unwrap();
         let loaded = hle.load(&mut mem, &xbe, &file, LAYOUT).unwrap();
@@ -698,5 +703,27 @@ mod tests {
         assert_eq!(exit, Exit::Halt, "the last thread ending stops the run");
         assert_eq!(out(&mut mem, 0), 0x55, "the second thread ran after the first returned");
         assert_eq!(hle.sched.thread_count(), 0);
+    }
+
+    #[test]
+    fn a_connected_interrupt_handler_runs_when_its_line_is_asserted() {
+        const INT: u32 = 0x2_0300;
+        let mut a = Asm::default();
+        let isr_patch = a.code.len() + 5 * 5 + 1; // the routine is the second argument: pushed sixth, 5 bytes per push
+        a.call("KeInitializeInterrupt", &[INT, 0, 0x99, 0x33, 5, 0, 0]);
+        a.call("KeConnectInterrupt", &[INT]);
+        a.store_const(1, 0x77); // main carries on after the handler ran
+        a.raw(&[0xF4]);
+        let isr = a.here();
+        a.store_const(0, 0x1234); // the handler: leave a mark, then return (stdcall, 2 arguments)
+        a.call("KeGetCurrentIrql", &[]);
+        a.store_eax(2);
+        a.raw(&[0xC2, 8, 0]);
+        a.code[isr_patch..isr_patch + 4].copy_from_slice(&isr.to_le_bytes());
+        let (mut mem, _, exit) = run_with(a, &[], |h| h.add_interrupt_source(0x33, |_| true));
+        assert_eq!(exit, Exit::Halt);
+        assert_eq!(out(&mut mem, 0), 0x1234, "the handler ran");
+        assert_eq!(out(&mut mem, 1), 0x77, "and the interrupted code resumed");
+        assert_eq!(out(&mut mem, 2), 5, "at the level the driver asked for");
     }
 }

@@ -12,7 +12,7 @@
 #![cfg(target_os = "linux")]
 
 use ferrox_core::Bus;
-use ferrox_cpu::{CpuBackend, CpuError, Exit, Regs, HLE_PORT};
+use ferrox_cpu::{CpuBackend, CpuError, Exit, Regs, FLAG_MASK, HLE_PORT};
 use ferrox_machine::MemSlot;
 use kvm_bindings::{kvm_regs, kvm_segment, kvm_userspace_memory_region, KVM_MEM_READONLY};
 use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
@@ -126,8 +126,10 @@ impl KvmCpu {
         sregs.ss = data;
         sregs.gdt.base = gdt_addr as u64;
         sregs.gdt.limit = 23;
-        sregs.cr0 |= 1; // protected mode
-        sregs.cr0 &= !(1 << 31); // no paging: guest-physical == linear
+        // protected mode, x87 reporting, no paging (guest-physical == linear), no FPU/SSE traps
+        sregs.cr0 = 0x33;
+        // OSFXSR | OSXMMEXCPT: the console's kernel turns SSE on before any game runs
+        sregs.cr4 |= 0x600;
         vcpu.set_sregs(&sregs).map_err(err("set sregs"))?;
         vcpu.set_regs(&kvm_regs { rip: entry as u64, rflags: 2, ..Default::default() })
             .map_err(err("set regs"))?;
@@ -196,6 +198,7 @@ impl CpuBackend for KvmCpu {
             gpr: [r.rax as u32, r.rcx as u32, r.rdx as u32, r.rbx as u32, r.rsp as u32, r.rbp as u32, r.rsi as u32, r.rdi as u32],
             eip: r.rip as u32,
             zf: r.rflags & 0x40 != 0,
+            eflags: (r.rflags as u32) & FLAG_MASK | 2,
         }
     }
 
@@ -219,7 +222,11 @@ impl CpuBackend for KvmCpu {
         r.rsi = g[6] as u64;
         r.rdi = g[7] as u64;
         r.rip = regs.eip as u64;
-        r.rflags = (r.rflags & !0x40) | if regs.zf { 0x40 } else { 0 };
+        r.rflags = if regs.eflags != 0 {
+            (r.rflags & !(FLAG_MASK as u64)) | (regs.eflags & FLAG_MASK) as u64 | 2
+        } else {
+            (r.rflags & !0x40) | if regs.zf { 0x40 } else { 0 }
+        };
         let _ = self.vcpu.set_regs(&r);
     }
 

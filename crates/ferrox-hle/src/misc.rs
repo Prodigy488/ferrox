@@ -144,6 +144,34 @@ fn sha_update(h: &mut [u32; 5], len: &mut u64, buf: &mut Vec<u8>, data: &[u8]) {
     buf.drain(..whole);
 }
 
+fn sha1(data: &[u8]) -> [u8; 20] {
+    let mut h = [0x6745_2301, 0xEFCD_AB89, 0x98BA_DCFE, 0x1032_5476, 0xC3D2_E1F0];
+    let (mut len, mut buf) = (0u64, Vec::new());
+    sha_update(&mut h, &mut len, &mut buf, data);
+    let mut total = len;
+    let mut pad = vec![0x80u8];
+    while (len as usize + pad.len()) % 64 != 56 {
+        pad.push(0);
+    }
+    pad.extend_from_slice(&(len * 8).to_be_bytes());
+    sha_update(&mut h, &mut total, &mut buf, &pad);
+    let mut out = [0u8; 20];
+    for (i, x) in h.iter().enumerate() {
+        out[4 * i..4 * i + 4].copy_from_slice(&x.to_be_bytes());
+    }
+    out
+}
+
+fn hmac_sha1(key: &[u8], msg: &[u8]) -> [u8; 20] {
+    let mut k = if key.len() > 64 { sha1(key).to_vec() } else { key.to_vec() };
+    k.resize(64, 0);
+    let mut inner: Vec<u8> = k.iter().map(|b| b ^ 0x36).collect();
+    inner.extend_from_slice(msg);
+    let mut outer: Vec<u8> = k.iter().map(|b| b ^ 0x5C).collect();
+    outer.extend_from_slice(&sha1(&inner));
+    sha1(&outer)
+}
+
 pub fn install(hle: &mut KernelHle, st: Rc<RefCell<KernelState>>) {
     // ---- strings and memory ----
     hle.handle("RtlInitUnicodeString", |c| {
@@ -477,6 +505,35 @@ pub fn install(hle: &mut KernelHle, st: Rc<RefCell<KernelState>>) {
         0
     });
 
+    // ---- keyed hashing, key parity, and the network PHY (no cable plugged in) ----
+    hle.handle("XcHMAC", |c| {
+        // (Key, KeyLength, Input1, Input1Length, Input2, Input2Length, Digest)
+        let (key, klen, i1, l1, i2, l2, out) = (arg(c, 0), arg(c, 1), arg(c, 2), arg(c, 3), arg(c, 4), arg(c, 5), arg(c, 6));
+        let mut read = |p: u32, n: u32| {
+            let mut v = vec![0u8; if p == 0 { 0 } else { n.min(1 << 20) as usize }];
+            let _ = c.bus.read_bytes(p as u64, &mut v);
+            v
+        };
+        let (key, mut msg) = (read(key, klen), read(i1, l1));
+        msg.extend(read(i2, l2));
+        let mac = hmac_sha1(&key, &msg);
+        let _ = c.bus.write_bytes(out as u64, &mac);
+        0
+    });
+    hle.handle("XcDESKeyParity", |c| {
+        let (key, n) = (arg(c, 0), arg(c, 1));
+        for i in 0..n.min(64) {
+            let b = rd8(c, key + i);
+            let fixed = (b & 0xFE) | ((b & 0xFE).count_ones() % 2 == 0) as u8;
+            let _ = c.bus.write((key + i) as u64, 1, fixed as u64);
+        }
+        0
+    });
+    hle.handle("PhyInitialize", |_| 0);
+    hle.handle("PhyGetLinkState", |_| 0);
+    hle.handle("XeLoadSection", |_| 0); // every section is already in memory
+    hle.handle("XeUnloadSection", |_| 0);
+
     // ---- SHA-1 ----
     hle.handle("XcSHAInit", |c| {
         let ctx = arg(c, 0);
@@ -535,6 +592,13 @@ mod tests {
         pad.extend_from_slice(&(len * 8).to_be_bytes());
         sha_update(&mut h, &mut total, &mut buf, &pad);
         assert_eq!(h, [0xA999_3E36, 0x4706_816A, 0xBA3E_2571, 0x7850_C26C, 0x9CD0_D89D]);
+    }
+
+    #[test]
+    fn hmac_sha1_matches_the_rfc_2202_vector() {
+        let mac = hmac_sha1(&[0x0b; 20], b"Hi There");
+        let hex: String = mac.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, "b617318655057264e28bc0b6fb378c8ef146be00");
     }
 
     #[test]

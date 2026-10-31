@@ -167,8 +167,17 @@ struct CallRec {
     ret: u32,
 }
 
+/// A device that can ask the processor for an interrupt on one vector.
+struct IrqSource {
+    vector: u32,
+    /// Given the current time (100 ns units), returns whether the line is asserted.
+    line: Box<dyn FnMut(u64) -> bool>,
+    last_fire: u64,
+}
+
 #[derive(Default)]
 pub struct KernelHle {
+    irq_sources: Vec<IrqSource>,
     /// Threads, waits and kernel objects.
     pub sched: Sched,
     log: VecDeque<CallRec>,
@@ -378,6 +387,50 @@ impl KernelHle {
         Ok(())
     }
 
+    /// Registers a device interrupt line. While `line` returns true and a driver has connected an
+    /// interrupt handler to `vector`, the handler is started whenever the interrupt level allows.
+    pub fn add_interrupt_source(&mut self, vector: u32, line: impl FnMut(u64) -> bool + 'static) {
+        self.irq_sources.push(IrqSource { vector, line: Box::new(line), last_fire: u64::MAX });
+    }
+
+    /// Starts the interrupt handler of an asserted line, if one is connected and not masked.
+    fn deliver_interrupts(&mut self, regs: &mut Regs, bus: &mut dyn Bus) -> bool {
+        if !self.sched.is_ready() || self.irq_sources.is_empty() {
+            return false;
+        }
+        let now = self.sched.now();
+        let irql = self.sched.irql(bus);
+        for src in &mut self.irq_sources {
+            // handlers get at least half a millisecond between runs: a handler that fails to
+            // silence its device would otherwise never let the game continue
+            if (src.last_fire != u64::MAX && now < src.last_fire + 5_000) || !(src.line)(now) {
+                continue;
+            }
+            let hit = self.sched.interrupts.iter().find(|(_, i)| i.connected && i.vector == src.vector);
+            let Some((&obj, &i)) = hit else { continue };
+            if irql >= i.irql {
+                continue;
+            }
+            src.last_fire = now;
+            self.sched.inject_call(bus, regs, i.routine, &[obj, i.context], i.irql);
+            return true;
+        }
+        false
+    }
+
+    /// Things that happen between two instructions: time passing, interrupts, deferred calls.
+    fn async_events(&mut self, cpu: &mut dyn CpuBackend, bus: &mut dyn Bus) {
+        if !self.sched.is_ready() {
+            return;
+        }
+        self.sched.tick(bus);
+        let mut regs = cpu.regs();
+        let moved = self.deliver_interrupts(&mut regs, bus) || self.sched.run_pending_dpc(bus, &mut regs);
+        if moved {
+            cpu.set_regs(regs);
+        }
+    }
+
     /// The most recent kernel calls, oldest first, for diagnostics.
     pub fn recent_calls(&self) -> Vec<String> {
         self.log
@@ -420,7 +473,9 @@ impl KernelHle {
             self.sched.reschedule(bus, regs)?;
             self.sched.set_irql(bus, 0);
         }
-        self.sched.run_pending_dpc(bus, regs);
+        if !self.deliver_interrupts(regs, bus) {
+            self.sched.run_pending_dpc(bus, regs);
+        }
         Ok(())
     }
 
@@ -487,9 +542,7 @@ impl KernelHle {
                 }
                 Exit::Budget => {
                     budget -= n;
-                    if self.sched.is_ready() {
-                        self.sched.tick(bus);
-                    }
+                    self.async_events(cpu, bus);
                 }
                 Exit::Halt => return Ok(Exit::Halt),
             }
