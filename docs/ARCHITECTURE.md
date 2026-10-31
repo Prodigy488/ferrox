@@ -71,7 +71,7 @@ PC. Known hazards, each with a plan:
 
 ## Testing strategy
 
-* Unit tests per crate (30 now). Parsers get truncation and corruption tests.
+* Unit tests per crate (27 now). Parsers get truncation and corruption tests.
 * Differential testing: use xemu as an oracle. Feed the same pushbuffer to both and
   compare register state or rendered frames.
 * Golden traces: record real games once, replay without the CPU.
