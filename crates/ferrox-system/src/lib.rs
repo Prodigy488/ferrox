@@ -467,6 +467,7 @@ fn gpu_demo(c: &mut Vec<u8>, call_dbgprint: Vec<u8>, push_fmt: Vec<u8>) {
     const COLOR_DMA: u32 = 0xC0DE;
     const PUSHBUF: u32 = 0x03F0_0000;
     const VERTICES: u32 = 0x03F1_0000;
+    const DEPTH_BUFFER: u32 = 0x0280_0000;
     let st = |c: &mut Vec<u8>, addr: u32, val: u32| {
         c.extend([0xC7, 0x05]); // mov dword [addr], imm32
         c.extend(addr.to_le_bytes());
@@ -506,19 +507,32 @@ fn gpu_demo(c: &mut Vec<u8>, call_dbgprint: Vec<u8>, push_fmt: Vec<u8>) {
     for (x0, x1, y0, y1, colour) in [(100u32, 539u32, 80u32, 399u32, 0xFFE0_8020u32), (180, 459, 140, 339, 0xFF10_2060)] {
         put(&[hdr(0x1D98, 2), x0 | (x1 << 16), y0 | (y1 << 16), hdr(0x1D90, 1), colour, hdr(0x1D94, 1), 0xF0]);
     }
+    // add a depth buffer (24-bit depth, 8-bit stencil), cleared to "far"; nearer things win from now on
+    let mut put = |ws: &[u32]| words.extend(ws.iter().map(|&w| Some(w)));
+    put(&[
+        hdr(0x198, 1), COLOR_DMA, hdr(0x208, 1), 0x128, hdr(0x20C, 1), 2560 | (2560 << 16), hdr(0x214, 1), DEPTH_BUFFER,
+        hdr(0x1D98, 2), 639 << 16, 479 << 16, hdr(0x1D8C, 1), 0xFFFF_FF00, hdr(0x1D94, 1), 0x03,
+        hdr(0x30C, 1), 1, hdr(0x354, 1), 0x201, hdr(0x35C, 1), 1, hdr(0x398, 1), 100.0f32.to_bits(),
+    ]);
     // a vertex program that transforms model-space vertices to pixels (scale 100 x 80, centred on 320, 240)
     let program = ferrox_nv2a::vsh::asm::matrix_program();
     let mut put = |ws: &[u32]| words.extend(ws.iter().map(|&w| Some(w)));
     put(&[hdr(0x1E94, 1), 2, hdr(0x1E9C, 1), 0, hdr(0x1EA0, 1), 0, hdr(0x1EA4, 1), 0, hdr(0xB00, program.len() as u32)]);
     put(&program);
     put(&[hdr(0xB80, 16)]);
-    for row in [[100.0f32, 0.0, 0.0, 320.0], [0.0, -80.0, 0.0, 240.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]] {
+    for row in [[100.0f32, 0.0, 0.0, 320.0], [0.0, -80.0, 0.0, 240.0], [0.0, 0.0, 10.0, 0.0], [0.0, 0.0, 0.0, 1.0]] {
         put(&row.map(f32::to_bits));
     }
     // a triangle with red, green and blue corners inside the inner rectangle, sent vertex by vertex
     put(&[hdr(0x17FC, 1), 5]);
     for (x, y, argb) in [(0.0f32, 1.0f32, 0xFFFF_0000u32), (-1.0, -1.0, 0xFF00_FF00), (1.0, -1.0, 0xFF00_00FF)] {
-        put(&[hdr(0x194C, 1), argb, hdr(0x1A00, 4), x.to_bits(), y.to_bits(), 0, 1.0f32.to_bits()]);
+        put(&[hdr(0x194C, 1), argb, hdr(0x1A00, 4), x.to_bits(), y.to_bits(), 1.0f32.to_bits(), 1.0f32.to_bits()]);
+    }
+    put(&[hdr(0x17FC, 1), 0]);
+    // a white quad drawn afterwards but farther away: hidden where it is behind the triangle
+    put(&[hdr(0x17FC, 1), 8]);
+    for (x, y) in [(0.2f32, 0.3f32), (1.2, 0.3), (1.2, -0.1), (0.2, -0.1)] {
+        put(&[hdr(0x194C, 1), 0xFFFF_FFFF, hdr(0x1A00, 4), x.to_bits(), y.to_bits(), 5.0f32.to_bits(), 1.0f32.to_bits()]);
     }
     put(&[hdr(0x17FC, 1), 0]);
     // a second triangle, read from a vertex array in memory: x, y, z floats and a packed colour per vertex
@@ -579,7 +593,7 @@ mod tests {
         let mut frames = Vec::new();
         let rep = run(&cfg, &Arc::new(AtomicBool::new(false)), |s| out.push_str(s), |f| frames.push(f)).unwrap();
         let game_out: String = out.lines().filter(|l| !l.starts_with("[ferrox]")).map(|l| format!("{l}\n")).collect();
-        assert_eq!(game_out, "gpu id: 02a000a3\ngpu took 472 bytes of commands\nhello, xbox! (test pattern drawn)\n");
+        assert_eq!(game_out, "gpu id: 02a000a3\ngpu took 692 bytes of commands\nhello, xbox! (test pattern drawn)\n");
         assert!(out.contains("display set: 640x480"), "{out}");
         assert!(out.contains("gpu id: 02a000a3"), "{out}");
         assert!(!out.contains("registers touched but not emulated"), "the demo only uses implemented registers: {out}");
@@ -599,10 +613,13 @@ mod tests {
         let mid = px(320, 280);
         assert!(mid[0] > 0x10 && mid[1] > 0x20 && mid[2] > 0x20, "colours blend inside the triangle: {mid:?}");
         assert_eq!(px(200, 160), [0x10, 0x20, 0x60, 0xFF], "outside the triangle is still the inner rectangle");
+        assert_eq!(px(420, 232), [0xFF, 0xFF, 0xFF, 0xFF], "the farther white quad shows where nothing is in front of it");
+        let hidden = px(350, 232);
+        assert!(hidden != [0xFF, 0xFF, 0xFF, 0xFF] && hidden[0] > 0x10, "the quad is hidden behind the triangle: {hidden:?}");
         let arr = px(140, 270);
         assert!(arr[0] > 0x80 && arr[1] > 0x80 && arr != [0xE0, 0x80, 0x20, 0xFF], "triangle read from a vertex array: {arr:?}");
         assert_eq!(px(120, 200), [0xE0, 0x80, 0x20, 0xFF], "outside the array triangle is still orange");
-        assert!(out.contains("GPU ran 84 commands (2 surface clears, 2 triangles)"), "{out}");
+        assert!(out.contains("GPU ran 118 commands (3 surface clears, 4 triangles)"), "{out}");
         assert_eq!(rep.outcome, Outcome::GuestStopped("HalReturnToFirmware(0)".into()));
         assert!(rep.backend.starts_with("reference"));
         std::fs::remove_dir_all(&dir).unwrap();

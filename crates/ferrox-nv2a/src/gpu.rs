@@ -8,7 +8,7 @@
 //! front end's report instead of silently doing nothing.
 
 use crate::device::Shared;
-use crate::raster::{self, Surface, Vertex};
+use crate::raster::{self, Depth, Surface, Vertex};
 use crate::vsh::{self, Program};
 use crate::{decode, Command};
 use ferrox_machine::RamView;
@@ -78,6 +78,11 @@ const NV097_SET_TRANSFORM_PROGRAM_LOAD: u32 = 0x1E9C;
 const NV097_SET_TRANSFORM_PROGRAM_START: u32 = 0x1EA0;
 const NV097_SET_TRANSFORM_CONSTANT_LOAD: u32 = 0x1EA4;
 const EXEC_MODE_PROGRAM: u32 = 2;
+const NV097_SET_DEPTH_TEST_ENABLE: u32 = 0x30C;
+const NV097_SET_DEPTH_FUNC: u32 = 0x354;
+const NV097_SET_DEPTH_MASK: u32 = 0x35C;
+const NV097_SET_CLIP_MAX: u32 = 0x398;
+const NV097_SET_ZSTENCIL_CLEAR_VALUE: u32 = 0x1D8C;
 const ATTR_DIFFUSE: usize = 3;
 const PRIM_TRIANGLES: u32 = 5;
 const PRIM_TRIANGLE_STRIP: u32 = 6;
@@ -121,6 +126,7 @@ pub struct Gpu {
     bound: [u32; 8],
     kelvin: BTreeMap<u32, u32>,
     color_base: u32,
+    zeta_base: u32,
     /// Current value of each of the 16 vertex attributes (position is 0, diffuse 3).
     attrs: [[f32; 4]; 16],
     /// Primitive type between Begin and End, 0 outside.
@@ -144,6 +150,7 @@ impl Gpu {
             bound: [0; 8],
             kelvin: BTreeMap::new(),
             color_base: 0,
+            zeta_base: 0,
             attrs: Self::initial_attrs(),
             prim: 0,
             verts: Vec::new(),
@@ -361,7 +368,16 @@ impl Gpu {
                 Some(b) => self.color_base = b,
                 None => self.shared.log(format!("colour DMA handle {v:#x} is not in the hash table")),
             },
-            NV097_SET_CONTEXT_DMA_NOTIFIES | NV097_SET_CONTEXT_DMA_ZETA => {
+            NV097_SET_CONTEXT_DMA_ZETA => match self.dma_base_of(v) {
+                Some(b) => self.zeta_base = b,
+                None => self.shared.log(format!("depth DMA handle {v:#x} is not in the hash table")),
+            },
+            NV097_SET_CONTEXT_DMA_NOTIFIES
+            | NV097_SET_DEPTH_TEST_ENABLE
+            | NV097_SET_DEPTH_FUNC
+            | NV097_SET_DEPTH_MASK
+            | NV097_SET_CLIP_MAX
+            | NV097_SET_ZSTENCIL_CLEAR_VALUE => {
                 self.kelvin.insert(m, v);
             }
             NV097_SET_SURFACE_CLIP_HORIZONTAL
@@ -464,6 +480,10 @@ impl Gpu {
     /// The colour surface as currently set up, if it is one the renderer can draw to.
     fn surface(&self) -> Option<Surface> {
         let ram = self.ram?;
+        if (self.k(NV097_SET_SURFACE_FORMAT) >> 8) & 0xF == 2 {
+            self.shared.gap("swizzled render targets".into());
+            return None;
+        }
         let clip_h = self.k(NV097_SET_SURFACE_CLIP_HORIZONTAL);
         let clip_v = self.k(NV097_SET_SURFACE_CLIP_VERTICAL);
         Some(Surface {
@@ -472,6 +492,28 @@ impl Gpu {
             pitch: (self.k(NV097_SET_SURFACE_PITCH) & 0xFFFF) as u64,
             format: self.k(NV097_SET_SURFACE_FORMAT) & 0xF,
             clip: (clip_h & 0xFFFF, clip_v & 0xFFFF, clip_h >> 16, clip_v >> 16),
+        })
+    }
+
+    /// The depth buffer, if one is set up (and depth testing is on, for `testing`).
+    fn depth(&self, testing: bool) -> Option<Depth> {
+        let format = (self.k(NV097_SET_SURFACE_FORMAT) >> 4) & 0xF;
+        if format == 0 || (testing && self.k(NV097_SET_DEPTH_TEST_ENABLE) == 0) {
+            return None;
+        }
+        if format > 2 {
+            self.shared.gap(format!("depth buffer format {format:#x}"));
+            return None;
+        }
+        let clip_max = f32::from_bits(self.k(NV097_SET_CLIP_MAX));
+        Some(Depth {
+            ram: self.ram?,
+            origin: self.zeta_base as u64 + self.k(NV097_SET_SURFACE_ZETA_OFFSET) as u64,
+            pitch: (self.k(NV097_SET_SURFACE_PITCH) >> 16) as u64,
+            format,
+            func: self.k(NV097_SET_DEPTH_FUNC) & 7,
+            write: self.k(NV097_SET_DEPTH_MASK) != 0,
+            clip_max: if clip_max > 0.0 { clip_max } else { 0xFF_FFFF as f32 },
         })
     }
 
@@ -522,8 +564,9 @@ impl Gpu {
         if self.k(NV097_SET_TRANSFORM_EXECUTION_MODE) & 3 != EXEC_MODE_PROGRAM {
             self.shared.gap("fixed-function transform not emulated: positions are used as screen coordinates".into());
         }
+        let depth = self.depth(true);
         for t in tris {
-            raster::fill_triangle(&surface, [verts[t[0]], verts[t[1]], verts[t[2]]]);
+            raster::fill_triangle(&surface, depth.as_ref(), [verts[t[0]], verts[t[1]], verts[t[2]]]);
             self.shared.count_triangle();
         }
     }
@@ -571,19 +614,70 @@ impl Gpu {
             let out = self.vsh.run(self.k(NV097_SET_TRANSFORM_PROGRAM_START) as usize, &self.attrs);
             let (p, c) = (out[vsh::O_POS], out[vsh::O_D0]);
             // the program has already applied the viewport: oPos is in pixels
-            self.verts.push(Vertex { x: p[0], y: p[1], color: c });
+            self.verts.push(Vertex { x: p[0], y: p[1], z: p[2], color: c });
         } else {
             let (p, c) = (self.attrs[0], self.attrs[ATTR_DIFFUSE]);
-            self.verts.push(Vertex { x: p[0], y: p[1], color: c });
+            self.verts.push(Vertex { x: p[0], y: p[1], z: p[2], color: c });
         }
+    }
+
+    /// The clear rectangle clipped to the surface: (x0, x1, y0, y1) inclusive, plus the clip origin.
+    fn clear_rect(&self) -> Option<(u32, u32, u32, u32, u32, u32)> {
+        let clip_h = self.k(NV097_SET_SURFACE_CLIP_HORIZONTAL);
+        let clip_v = self.k(NV097_SET_SURFACE_CLIP_VERTICAL);
+        let (cx, cw) = (clip_h & 0xFFFF, clip_h >> 16);
+        let (cy, ch) = (clip_v & 0xFFFF, clip_v >> 16);
+        let rh = self.k(NV097_SET_CLEAR_RECT_HORIZONTAL);
+        let rv = self.k(NV097_SET_CLEAR_RECT_VERTICAL);
+        let (x0, x1) = (rh & 0xFFFF, (rh >> 16).min(cw.saturating_sub(1)));
+        let (y0, y1) = (rv & 0xFFFF, (rv >> 16).min(ch.saturating_sub(1)));
+        (cw != 0 && ch != 0 && x0 <= x1 && y0 <= y1).then_some((x0, x1, y0, y1, cx, cy))
+    }
+
+    fn clear_zeta(&mut self, flags: u32) {
+        if (self.k(NV097_SET_SURFACE_FORMAT) >> 8) & 0xF == 2 {
+            self.shared.gap("swizzled render targets".into());
+            return;
+        }
+        let Some(d) = self.depth(false) else { return };
+        let Some((x0, x1, y0, y1, cx, cy)) = self.clear_rect() else { return };
+        let value = self.k(NV097_SET_ZSTENCIL_CLEAR_VALUE);
+        let bpp = d.bytes_per_pixel();
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let at = d.origin + (cy + y) as u64 * d.pitch + (cx + x) as u64 * bpp;
+                let ok = if d.format == 1 {
+                    // 16-bit depth has no stencil
+                    flags & 1 == 0 || d.ram.write(at, &(value as u16).to_le_bytes())
+                } else {
+                    let Some(old) = d.ram.read_u32(at) else { return };
+                    let mut new = old;
+                    if flags & 1 != 0 {
+                        new = (new & 0xFF) | (value & 0xFFFF_FF00);
+                    }
+                    if flags & 2 != 0 {
+                        new = (new & 0xFFFF_FF00) | (value & 0xFF);
+                    }
+                    d.ram.write_u32(at, new)
+                };
+                if !ok {
+                    self.shared.log(format!("depth clear outside memory at {at:#x}"));
+                    return;
+                }
+            }
+        }
+        self.shared.count_clear();
     }
 
     fn clear_surface(&mut self, flags: u32) {
         if flags & 3 != 0 {
-            self.shared.gap("clearing the depth/stencil buffer".into());
+            self.clear_zeta(flags);
         }
         let colour_mask = flags & 0xF0;
         if colour_mask == 0 {
+            return;
+        }
+        if self.surface().is_none() {
             return;
         }
         let Some(ram) = self.ram else { return };
@@ -985,5 +1079,91 @@ mod tests {
         kick(&mut g, &mut mem, &w);
         // elements 0,1,3,2 as TRIANGLES: only the first three (0,1,3) form a triangle
         assert_eq!(shared.triangles(), 1);
+    }
+
+    const ZB: u32 = 0x18_0000;
+
+    fn depth_setup() -> Vec<u32> {
+        let mut w = vec![
+            hdr(0, 1), KELVIN, hdr(0x194, 1), COLOR_DMA, hdr(0x198, 1), COLOR_DMA, hdr(0x200, 2), 64 << 16, 32 << 16,
+            hdr(0x208, 1), 0x128, // 8888 colour, Z24S8 depth, pitch layout
+            hdr(0x20C, 2), 256 | (256 << 16), FB, // pitches and colour offset
+            hdr(0x214, 1), ZB,
+            hdr(0x1D98, 2), 63 << 16, 31 << 16, hdr(0x1D8C, 1), 0xFFFF_FF00, hdr(0x1D94, 1), 0x03,
+            hdr(0x30C, 1), 1, hdr(0x354, 1), 0x201, hdr(0x35C, 1), 1, hdr(0x398, 1), 100.0f32.to_bits(),
+        ];
+        w.extend([hdr(0x1D90, 1), 0]);
+        w
+    }
+
+    fn vertex3(x: f32, y: f32, z: f32, argb: u32) -> Vec<u32> {
+        vec![hdr(0x194C, 1), argb, hdr(0x1A00, 4), f(x), f(y), f(z), f(1.0)]
+    }
+
+    fn tri(z: f32, argb: u32) -> Vec<u32> {
+        let mut w = vec![hdr(0x17FC, 1), 5];
+        w.extend(vertex3(4.0, 4.0, z, argb));
+        w.extend(vertex3(60.0, 4.0, z, argb));
+        w.extend(vertex3(4.0, 28.0, z, argb));
+        w.extend([hdr(0x17FC, 1), 0]);
+        w
+    }
+
+    #[test]
+    fn depth_buffer_hides_the_farther_triangle() {
+        for far_first in [true, false] {
+            let (mut g, shared, mut mem) = setup();
+            init(&mut g);
+            let mut w = depth_setup();
+            let (near, far) = (tri(10.0, 0xFFFF_0000), tri(60.0, 0xFF00_00FF));
+            if far_first {
+                w.extend(far);
+                w.extend(near);
+            } else {
+                w.extend(near);
+                w.extend(far);
+            }
+            kick(&mut g, &mut mem, &w);
+            assert_eq!(pixel(&mut mem, 10, 8), 0xFFFF_0000, "far first: {far_first}");
+            assert_eq!(shared.triangles(), 2);
+            let zv = mem.ram_view(0).unwrap().read_u32((ZB + 8 * 256 + 10 * 4) as u64).unwrap();
+            assert_eq!(zv >> 8, (10.0f32 / 100.0 * 16777215.0 + 0.5) as u32, "the near depth is stored");
+        }
+    }
+
+    #[test]
+    fn without_depth_testing_the_later_triangle_wins() {
+        let (mut g, _, mut mem) = setup();
+        init(&mut g);
+        let mut w = depth_setup();
+        w.extend([hdr(0x30C, 1), 0]);
+        w.extend(tri(10.0, 0xFFFF_0000));
+        w.extend(tri(60.0, 0xFF00_00FF));
+        kick(&mut g, &mut mem, &w);
+        assert_eq!(pixel(&mut mem, 10, 8), 0xFF00_00FF);
+    }
+
+    #[test]
+    fn depth_clear_respects_the_rectangle_and_stencil_bits() {
+        let (mut g, _, mut mem) = setup();
+        init(&mut g);
+        let mut w = depth_setup();
+        // clear only the stencil byte of a small rectangle to 0x7F
+        w.extend([hdr(0x1D98, 2), 2 | (3 << 16), 2 | (3 << 16), hdr(0x1D8C, 1), 0x0000_007F, hdr(0x1D94, 1), 0x02]);
+        kick(&mut g, &mut mem, &w);
+        let v = mem.ram_view(0).unwrap();
+        let at = |x: u32, y: u32| v.read_u32((ZB + y * 256 + x * 4) as u64).unwrap();
+        assert_eq!(at(2, 2), 0xFFFF_FF7F, "depth kept, stencil set");
+        assert_eq!(at(4, 2), 0xFFFF_FF00, "outside the rectangle");
+    }
+
+    #[test]
+    fn swizzled_targets_are_reported_not_drawn_wrongly() {
+        let (mut g, shared, mut mem) = setup();
+        init(&mut g);
+        let mut w = depth_setup();
+        w.extend([hdr(0x208, 1), 0x208, hdr(0x1D90, 1), 0xFFFF_FFFF, hdr(0x1D94, 1), 0xF0]);
+        kick(&mut g, &mut mem, &w);
+        assert!(shared.gaps().iter().any(|(k, _)| k.contains("swizzled")), "{:?}", shared.gaps());
     }
 }
