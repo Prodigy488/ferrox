@@ -53,7 +53,7 @@ pub enum Mode {
 }
 
 /// What the demo game prints, with the harness's own `[ferrox]` lines removed.
-pub const DEMO_GAME_OUTPUT: &str = "gpu id: 02a000a3\ngpu took 940 bytes of commands\nhello, xbox! (test pattern drawn)\n";
+pub const DEMO_GAME_OUTPUT: &str = "gpu id: 02a000a3\ngpu took 1204 bytes of commands\nhello, xbox! (test pattern drawn)\n";
 
 /// Checks the text a demo run produced.
 pub fn check_demo_output(out: &str) -> Vec<Check> {
@@ -63,13 +63,13 @@ pub fn check_demo_output(out: &str) -> Vec<Check> {
         Check::new("guest output is exactly what the demo prints", game == DEMO_GAME_OUTPUT, if game == DEMO_GAME_OUTPUT { String::new() } else { format!("got {game:?}") }),
         Check::new("display mode was set to 640x480", out.contains("display set: 640x480"), ""),
         Check::new(
-            "GPU ran every command (159 commands, 3 clears, 6 triangles)",
-            out.contains("GPU ran 159 commands (3 surface clears, 6 triangles)"),
+            "GPU ran every command (198 commands, 3 clears, 8 triangles)",
+            out.contains("GPU ran 198 commands (3 surface clears, 8 triangles)"),
             out.lines().find(|l| l.contains("GPU ran")).unwrap_or("no GPU summary line").to_string(),
         ),
         Check::new(
-            "the only unemulated feature reported is the register combiners",
-            gaps.len() == 1 && gaps[0].contains("register combiners") && !gaps[0].contains("; "),
+            "no unemulated GPU feature is reported",
+            gaps.is_empty(),
             format!("{gaps:?}"),
         ),
         Check::new("no unemulated GPU registers touched", !out.contains("registers touched but not emulated"), ""),
@@ -78,7 +78,7 @@ pub fn check_demo_output(out: &str) -> Vec<Check> {
 }
 
 /// Checks the picture the demo draws: the gradient, two clears, a vertex-program
-/// triangle, a vertex-array triangle, a depth-hidden quad and a textured quad.
+/// triangle, a vertex-array triangle, a depth-hidden quad, a combiner-shaded textured quad and a blended quad.
 pub fn check_demo_frame(f: &Frame) -> Vec<Check> {
     if (f.width, f.height) != (640, 480) || f.rgba.len() != 640 * 480 * 4 {
         return vec![Check::new("picture is 640x480", false, format!("{}x{}", f.width, f.height))];
@@ -107,7 +107,7 @@ pub fn check_demo_frame(f: &Frame) -> Vec<Check> {
         probe("depth: far quad visible where nothing is in front", px(420, 232), [0xFF; 4]),
         range("depth: far quad hidden behind the triangle", hidden, hidden != [0xFF; 4] && hidden[0] > 0x10),
         probe("texture: texel (1, 2)", px(492, 212), [85, 170, 0x80, 0xFF]),
-        probe("texture: texel (3, 3)", px(522, 238), [255, 255, 0x80, 0xFF]),
+        range("blending: the translucent quad darkens texel (3, 3)", px(522, 238), px(522, 238).iter().zip([127u8, 127, 64, 255]).all(|(a, b)| a.abs_diff(b) <= 2)),
     ]
 }
 

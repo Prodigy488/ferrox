@@ -9,6 +9,7 @@
 //! Decoding is a pure function of the buffer, so it can be unit tested and
 //! used for offline tools such as pushbuffer dumpers without any GPU state.
 
+pub mod combiner;
 pub mod device;
 pub mod gpu;
 pub mod raster;

@@ -460,7 +460,7 @@ pub fn demo_xbe() -> Vec<u8> {
 /// Machine code for the demo's GPU part: describes a few objects to the GPU,
 /// sends it a command buffer that draws two filled rectangles and two
 /// colour-blended triangles (one transformed by a vertex program, one read from a vertex array), a
-/// depth-tested quad and a textured quad over the gradient, and prints how many command bytes the GPU consumed.
+/// depth-tested quad, a combiner-shaded textured quad and an alpha-blended quad over the gradient, and prints how many command bytes the GPU consumed.
 /// `ebx` holds the framebuffer address.
 fn gpu_demo(c: &mut Vec<u8>, call_dbgprint: Vec<u8>, push_fmt: Vec<u8>) {
     use ferrox_nv2a::gpu::{ramht_hash, KELVIN_CLASS};
@@ -560,11 +560,30 @@ fn gpu_demo(c: &mut Vec<u8>, call_dbgprint: Vec<u8>, push_fmt: Vec<u8>) {
         hdr(0x1B04, 1), 1 | (2 << 4) | (0x06 << 8) | (1 << 16) | (2 << 20) | (2 << 24),
         hdr(0x1B08, 1), 0x0001_0101, hdr(0x1B0C, 1), 1 << 30, hdr(0x1B14, 1), (1 << 16) | (1 << 24), hdr(0x1E70, 1), 1,
     ]);
+    // register combiners: one stage, r0 = texture * diffuse (colour and alpha), final output = r0
+    put(&[
+        hdr(0xAC0, 1), 0x0804_0000, hdr(0x1E40, 1), 0xC0,
+        hdr(0x260, 1), 0x1814_0000, hdr(0xAA0, 1), 0xC0,
+        hdr(0x288, 1), 0x0000_0C00, hdr(0x28C, 1), 0x0000_1C00,
+        hdr(0x1E60, 1), 1,
+    ]);
     put(&[hdr(0x17FC, 1), 8]);
     for (x, y, s_, t_) in [(1.5f32, 1.125f32, 0.0f32, 0.0f32), (2.1, 1.125, 1.0, 0.0), (2.1, -0.125, 1.0, 1.0), (1.5, -0.125, 0.0, 1.0)] {
         put(&[hdr(0x194C, 1), 0xFFFF_FFFF, hdr(0x18C8, 2), s_.to_bits(), t_.to_bits(), hdr(0x1A00, 4), x.to_bits(), y.to_bits(), 0, 1.0f32.to_bits()]);
     }
     put(&[hdr(0x17FC, 1), 0]);
+    // a translucent black quad over the right half of the textured one: source-alpha blending,
+    // no texture, combiners that pass the diffuse colour straight through
+    put(&[
+        hdr(0x1B0C, 1), 0, hdr(0x1E70, 1), 0, hdr(0x30C, 1), 0,
+        hdr(0xAC0, 1), 0x0420_0000, hdr(0x260, 1), 0x1420_0000,
+        hdr(0x304, 1), 1, hdr(0x344, 1), 0x302, hdr(0x348, 1), 0x303, hdr(0x350, 1), 0x8006,
+        hdr(0x17FC, 1), 8,
+    ]);
+    for (x, y) in [(1.8f32, 1.125f32), (2.1, 1.125), (2.1, -0.125), (1.8, -0.125)] {
+        put(&[hdr(0x194C, 1), 0x8000_0000, hdr(0x1A00, 4), x.to_bits(), y.to_bits(), 0, 1.0f32.to_bits()]);
+    }
+    put(&[hdr(0x17FC, 1), 0, hdr(0x304, 1), 0]);
     for y in 0..4u32 {
         for x in 0..4u32 {
             let index = ferrox_nv2a::texture::swizzle_index(x, y, 4, 4);

@@ -7,6 +7,7 @@
 //! engine is asked to do is recorded in `Shared::gaps` so it shows up in the
 //! front end's report instead of silently doing nothing.
 
+use crate::combiner::Combiner;
 use crate::device::Shared;
 use crate::raster::{self, Depth, Surface, Vertex};
 use crate::texture::{self, Address, Texture};
@@ -88,7 +89,17 @@ const NV097_SET_CONTEXT_DMA_A: u32 = 0x184;
 const NV097_SET_CONTEXT_DMA_B: u32 = 0x188;
 const NV097_SET_TEXTURE_BASE: u32 = 0x1B00; // four stages of 0x40 bytes
 const NV097_SET_SHADER_STAGE_PROGRAM: u32 = 0x1E70;
+const NV097_SET_ALPHA_TEST_ENABLE: u32 = 0x300;
+const NV097_SET_BLEND_ENABLE: u32 = 0x304;
+const NV097_SET_ALPHA_FUNC: u32 = 0x33C;
+const NV097_SET_ALPHA_REF: u32 = 0x340;
+const NV097_SET_BLEND_FUNC_SFACTOR: u32 = 0x344;
+const NV097_SET_BLEND_FUNC_DFACTOR: u32 = 0x348;
+const NV097_SET_BLEND_COLOR: u32 = 0x34C;
+const NV097_SET_BLEND_EQUATION: u32 = 0x350;
+const NV097_SET_COLOR_MASK: u32 = 0x358;
 const ATTR_DIFFUSE: usize = 3;
+const ATTR_SPECULAR: usize = 4;
 const ATTR_TEXCOORD0: usize = 9;
 const PRIM_TRIANGLES: u32 = 5;
 const PRIM_TRIANGLE_STRIP: u32 = 6;
@@ -143,6 +154,7 @@ pub struct Gpu {
     const_load: usize,
     vertex_base: [u32; 2],
     texture_base: [u32; 2],
+    comb: Combiner,
 }
 
 impl Gpu {
@@ -166,6 +178,7 @@ impl Gpu {
             const_load: 0,
             vertex_base: [0; 2],
             texture_base: [0; 2],
+            comb: Combiner::default(),
         }
     }
 
@@ -385,6 +398,15 @@ impl Gpu {
             | NV097_SET_DEPTH_FUNC
             | NV097_SET_DEPTH_MASK
             | NV097_SET_CLIP_MAX
+            | NV097_SET_ALPHA_TEST_ENABLE
+            | NV097_SET_BLEND_ENABLE
+            | NV097_SET_ALPHA_FUNC
+            | NV097_SET_ALPHA_REF
+            | NV097_SET_BLEND_FUNC_SFACTOR
+            | NV097_SET_BLEND_FUNC_DFACTOR
+            | NV097_SET_BLEND_COLOR
+            | NV097_SET_BLEND_EQUATION
+            | NV097_SET_COLOR_MASK
             | NV097_SET_ZSTENCIL_CLEAR_VALUE => {
                 self.kelvin.insert(m, v);
             }
@@ -411,6 +433,7 @@ impl Gpu {
             NV097_SET_SHADER_STAGE_PROGRAM => {
                 self.kelvin.insert(m, v);
             }
+            _ if self.comb.write(m, v) => {}
             NV097_SET_TRANSFORM_PROGRAM..=0xB7C => {
                 let slot = ((m - NV097_SET_TRANSFORM_PROGRAM) / 4) as usize;
                 if self.prog_load < vsh::MAX_INSTRUCTIONS {
@@ -510,7 +533,65 @@ impl Gpu {
             pitch: (self.k(NV097_SET_SURFACE_PITCH) & 0xFFFF) as u64,
             format: self.k(NV097_SET_SURFACE_FORMAT) & 0xF,
             clip: (clip_h & 0xFFFF, clip_v & 0xFFFF, clip_h >> 16, clip_v >> 16),
+            ops: raster::PixelOps::default(),
         })
+    }
+
+    /// Alpha test, blending and the colour write mask as currently set.
+    fn pixel_ops(&self) -> raster::PixelOps {
+        use raster::{AlphaTest, Blend, Equation, Factor};
+        let mut ops = raster::PixelOps::default();
+        if let Some(&m) = self.kelvin.get(&NV097_SET_COLOR_MASK) {
+            ops.mask = [m >> 16 & 1 != 0, m >> 8 & 1 != 0, m & 1 != 0, m >> 24 & 1 != 0];
+        }
+        if self.k(NV097_SET_ALPHA_TEST_ENABLE) != 0 {
+            ops.alpha_test = Some(AlphaTest {
+                func: self.k(NV097_SET_ALPHA_FUNC) & 0xF,
+                reference: self.k(NV097_SET_ALPHA_REF) & 0xFF,
+            });
+        }
+        if self.k(NV097_SET_BLEND_ENABLE) != 0 {
+            // before a game sets them, the reset state is source * 1 + destination * 0
+            let factor = |m: u32, default: Factor| match self.kelvin.get(&m) {
+                None => Some(default),
+                Some(&v) => {
+                    let f = Factor::from_method(v);
+                    if f.is_none() {
+                        self.shared.gap(format!("blend factor {v:#x}"));
+                    }
+                    f
+                }
+            };
+            let equation = match self.kelvin.get(&NV097_SET_BLEND_EQUATION) {
+                None => Some(Equation::Add),
+                Some(&v) => {
+                    let e = Equation::from_method(v);
+                    if e.is_none() {
+                        self.shared.gap(format!("blend equation {v:#x}"));
+                    }
+                    e
+                }
+            };
+            let c = self.k(NV097_SET_BLEND_COLOR);
+            if let (Some(src), Some(dst), Some(equation)) = (
+                factor(NV097_SET_BLEND_FUNC_SFACTOR, Factor::One),
+                factor(NV097_SET_BLEND_FUNC_DFACTOR, Factor::Zero),
+                equation,
+            ) {
+                ops.blend = Some(Blend {
+                    src,
+                    dst,
+                    equation,
+                    constant: [
+                        (c >> 16 & 0xFF) as f32 / 255.0,
+                        (c >> 8 & 0xFF) as f32 / 255.0,
+                        (c & 0xFF) as f32 / 255.0,
+                        (c >> 24) as f32 / 255.0,
+                    ],
+                });
+            }
+        }
+        ops
     }
 
     /// The depth buffer, if one is set up (and depth testing is on, for `testing`).
@@ -645,7 +726,8 @@ impl Gpu {
         if tris.is_empty() {
             return;
         }
-        let Some(surface) = self.surface() else { return };
+        let Some(mut surface) = self.surface() else { return };
+        surface.ops = self.pixel_ops();
         if raster::bytes_per_pixel(surface.format).is_none() {
             self.shared.gap(format!("drawing into a colour surface of format {:#x}", surface.format));
             return;
@@ -655,11 +737,19 @@ impl Gpu {
         }
         let depth = self.depth(true);
         let texture = self.texture0();
-        if texture.is_some() {
-            self.shared.gap("register combiners: the texture is multiplied with the diffuse colour".into());
-        }
+        let comb = if self.comb.programmed() {
+            for g in self.comb.gaps() {
+                self.shared.gap(g);
+            }
+            Some(&self.comb)
+        } else {
+            if texture.is_some() {
+                self.shared.gap("register combiners were never programmed: the texture is multiplied with the diffuse colour".into());
+            }
+            None
+        };
         for t in tris {
-            raster::fill_triangle(&surface, depth.as_ref(), texture.as_ref(), [verts[t[0]], verts[t[1]], verts[t[2]]]);
+            raster::fill_triangle(&surface, depth.as_ref(), texture.as_ref(), comb, [verts[t[0]], verts[t[1]], verts[t[2]]]);
             self.shared.count_triangle();
         }
     }
@@ -705,13 +795,14 @@ impl Gpu {
         }
         if self.k(NV097_SET_TRANSFORM_EXECUTION_MODE) & 3 == EXEC_MODE_PROGRAM {
             let out = self.vsh.run(self.k(NV097_SET_TRANSFORM_PROGRAM_START) as usize, &self.attrs);
-            let (p, c) = (out[vsh::O_POS], out[vsh::O_D0]);
+            let (p, c, sp) = (out[vsh::O_POS], out[vsh::O_D0], out[vsh::O_D1]);
             // the program has already applied the viewport: oPos is in pixels
             let w = if p[3] > 0.0 { p[3] } else { 1.0 };
-            self.verts.push(Vertex { x: p[0], y: p[1], z: p[2], w, color: c, tex: out[vsh::O_T0] });
+            self.verts.push(Vertex { x: p[0], y: p[1], z: p[2], w, color: c, spec: sp, tex: out[vsh::O_T0] });
         } else {
             let (p, c) = (self.attrs[0], self.attrs[ATTR_DIFFUSE]);
-            self.verts.push(Vertex { x: p[0], y: p[1], z: p[2], w: 1.0, color: c, tex: self.attrs[ATTR_TEXCOORD0] });
+            let sp = self.attrs[ATTR_SPECULAR];
+            self.verts.push(Vertex { x: p[0], y: p[1], z: p[2], w: 1.0, color: c, spec: sp, tex: self.attrs[ATTR_TEXCOORD0] });
         }
     }
 
@@ -976,11 +1067,11 @@ mod tests {
     fn unknown_methods_and_bad_handles_are_reported_not_fatal() {
         let (mut g, shared, mut mem) = setup();
         init(&mut g);
-        kick(&mut g, &mut mem, &[hdr(0x100, 1), 0, hdr(0, 1), 0x1234, hdr(0, 1), KELVIN, hdr(0x1E20, 1), 7]);
+        kick(&mut g, &mut mem, &[hdr(0x100, 1), 0, hdr(0, 1), 0x1234, hdr(0, 1), KELVIN, hdr(0x1E28, 1), 7]);
         let log = shared.take_log();
         assert!(log.iter().any(|l| l.contains("no object bound")), "{log:?}");
         assert!(log.iter().any(|l| l.contains("0x1234")), "{log:?}");
-        assert!(shared.gaps().iter().any(|(k, _)| k.contains("0x1e20")), "{:?}", shared.gaps());
+        assert!(shared.gaps().iter().any(|(k, _)| k.contains("0x1e28")), "{:?}", shared.gaps());
     }
 
     #[test]
@@ -1314,7 +1405,72 @@ mod tests {
         }
         assert_eq!(pixel(&mut mem, 6, 10), 0, "outside the quad");
         let gaps = shared.gaps();
-        assert!(gaps.iter().any(|(k, _)| k.contains("register combiners")), "{gaps:?}");
+        assert!(gaps.iter().any(|(k, _)| k.contains("register combiners were never programmed")), "{gaps:?}");
+    }
+
+    #[test]
+    fn programmed_combiners_replace_the_modulate_rule() {
+        use crate::combiner::{icw, input, map, ocw, reg};
+        let (mut g, shared, mut mem) = setup();
+        init(&mut g);
+        put_texture(&mut mem);
+        let mut w = setup_surface();
+        w.extend(texture_state(0x06));
+        let inv_t0 = input(reg::T0, false, map::UNSIGNED_INVERT);
+        let one = input(reg::ZERO, false, map::UNSIGNED_INVERT);
+        let t0a = input(reg::T0, true, 0);
+        let r0 = input(reg::R0, false, 0);
+        w.extend([
+            hdr(0xAC0, 1), icw(inv_t0, one, 0, 0), // colour stage 0: r0 = (1 - t0) * 1
+            hdr(0x1E40, 1), ocw(0, reg::R0, 0, 0),
+            hdr(0x260, 1), icw(t0a, input(reg::ZERO, false, map::UNSIGNED_INVERT), 0, 0), // alpha: r0.a = t0.a
+            hdr(0xAA0, 1), ocw(0, reg::R0, 0, 0),
+            hdr(0x288, 1), icw(0, 0, r0, 0), // final: colour = c = r0
+            hdr(0x28C, 1), icw(0, 0, input(reg::R0, true, 0), 0), // alpha = r0.a
+            hdr(0x1E60, 1), 1,
+        ]);
+        w.extend(textured_quad());
+        kick(&mut g, &mut mem, &w);
+        assert_eq!(shared.triangles(), 2);
+        let got = pixel(&mut mem, 10, 5); // texel (0, 0): r 10, g 10, b 0x80
+        let ch = |v: u32, s: u32| (v >> s & 0xFF) as i32;
+        assert!((ch(got, 16) - 245).abs() <= 1 && (ch(got, 8) - 245).abs() <= 1 && (ch(got, 0) - 127).abs() <= 1, "{got:#x}");
+        assert_eq!(ch(got, 24), 255);
+        let gaps = shared.gaps();
+        assert!(!gaps.iter().any(|(k, _)| k.contains("register combiners")), "{gaps:?}");
+    }
+
+    #[test]
+    fn blend_alpha_test_and_mask_methods_reach_the_rasteriser() {
+        let (mut g, shared, mut mem) = setup();
+        init(&mut g);
+        let mut w = setup_surface();
+        // blue background through a clear, then half-transparent red through source-alpha blending
+        w.extend([hdr(0x1D98, 2), 63 << 16, 31 << 16, hdr(0x1D90, 1), 0xFF00_00FF, hdr(0x1D94, 1), 0xF0]);
+        w.extend([
+            hdr(0x304, 1), 1, hdr(0x344, 1), 0x302, hdr(0x348, 1), 0x303, hdr(0x350, 1), 0x8006,
+            hdr(0x17FC, 1), 5,
+        ]);
+        for (x, y) in [(2.0, 2.0), (30.0, 2.0), (2.0, 30.0)] {
+            w.extend([hdr(0x194C, 1), 0x80FF_0000, hdr(0x1A00, 4), f(x), f(y), f(0.0), f(1.0)]);
+        }
+        w.extend([hdr(0x17FC, 1), 0]);
+        kick(&mut g, &mut mem, &w);
+        assert_eq!(shared.triangles(), 1, "{:?} {:?}", shared.take_log(), shared.gaps());
+        let p = pixel(&mut mem, 6, 6);
+        assert!((((p >> 16) & 0xFF) as i32 - 128).abs() <= 1 && ((p & 0xFF) as i32 - 127).abs() <= 1, "{p:#x}");
+        assert!(shared.gaps().iter().all(|(k, _)| !k.contains("blend")), "{:?}", shared.gaps());
+        // an unknown factor is reported, not guessed
+        let (mut g, shared, mut mem) = setup();
+        init(&mut g);
+        let mut w2 = setup_surface();
+        w2.extend([hdr(0x304, 1), 1, hdr(0x344, 1), 0x1234, hdr(0x17FC, 1), 5]);
+        for (x, y) in [(2.0, 2.0), (30.0, 2.0), (2.0, 30.0)] {
+            w2.extend([hdr(0x1A00, 4), f(x), f(y), f(0.0), f(1.0)]);
+        }
+        w2.extend([hdr(0x17FC, 1), 0]);
+        kick(&mut g, &mut mem, &w2);
+        assert!(shared.gaps().iter().any(|(k, _)| k.contains("blend factor")), "{:?}", shared.gaps());
     }
 
     #[test]
