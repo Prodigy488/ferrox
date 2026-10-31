@@ -510,10 +510,17 @@ impl CpuBackend for WhpCpu {
     /// Runs until the guest halts, calls the host, or has run one time slice.
     /// `max_instructions` is ignored: hardware virtualization cannot count them.
     fn run(&mut self, bus: &mut dyn Bus, _max_instructions: u64) -> Result<Exit, CpuError> {
+        // a guest that keeps touching hardware exits again and again before the watchdog's cancel
+        // can land, so the slice is also timed here: control must come back to the host regularly
+        let slice = TICK * self.wd.slice_ticks.load(Ordering::Relaxed) as u32;
+        let began = std::time::Instant::now();
+        self.wd.ticks.store(0, Ordering::Relaxed);
         loop {
+            if began.elapsed() >= slice {
+                return Ok(Exit::Budget);
+            }
             trace("running guest");
             let mut ctx = WHV_RUN_VP_EXIT_CONTEXT::default();
-            self.wd.ticks.store(0, Ordering::Relaxed);
             self.wd.running.store(true, Ordering::Release);
             // SAFETY: ctx is a valid exit-context buffer of the size passed.
             let hr = unsafe {

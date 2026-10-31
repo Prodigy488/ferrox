@@ -233,7 +233,14 @@ impl CpuBackend for KvmCpu {
     /// Runs until the guest halts, calls the host, or has run one time slice.
     /// `max_instructions` is ignored: hardware virtualization cannot count them.
     fn run(&mut self, bus: &mut dyn Bus, _max_instructions: u64) -> Result<Exit, CpuError> {
+        // a guest that keeps touching hardware exits before the watchdog's signal lands, so the
+        // slice is also timed here
+        let slice = TICK * self.wd.slice_ticks.load(Ordering::Relaxed) as u32;
+        let began = std::time::Instant::now();
         loop {
+            if began.elapsed() >= slice {
+                return Ok(Exit::Budget);
+            }
             self.wd.ticks.store(0, Ordering::Relaxed);
             self.wd.kicked.store(false, Ordering::Relaxed);
             self.wd.runner.store(unsafe { libc::pthread_self() } as usize, Ordering::Release);
