@@ -111,9 +111,24 @@ pub fn hardware_virtualization() -> bool {
     {
         ferrox_kvm::available()
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        ferrox_whpx::available()
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         false
+    }
+}
+
+/// Why no fast CPU is available here, in words a player can act on.
+pub fn virtualization_help() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "Enable virtualization in the BIOS/UEFI and add your user to the 'kvm' group."
+    } else if cfg!(windows) {
+        "Turn on virtualization in the BIOS/UEFI, then enable the 'Windows Hypervisor Platform' optional feature (Turn Windows features on or off) and restart."
+    } else {
+        "A hardware-virtualization backend for this platform is not written yet."
     }
 }
 
@@ -128,9 +143,10 @@ fn make_backend(
             #[cfg(target_os = "linux")]
             {
                 if !ferrox_kvm::available() {
-                    return Err("this computer does not offer hardware virtualization (/dev/kvm). \
-                                Enable it in the BIOS/UEFI and add your user to the kvm group."
-                        .into());
+                    return Err(format!(
+                        "this computer does not offer hardware virtualization (/dev/kvm). {}",
+                        virtualization_help()
+                    ));
                 }
                 mem.load(GDT_ADDR as u64, &ferrox_kvm::flat_gdt()).map_err(|e| e.to_string())?;
                 let slots = mem.mem_slots();
@@ -140,10 +156,25 @@ fn make_backend(
                     .map_err(|e| e.to_string())?;
                 Ok(Box::new(cpu))
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(windows)]
+            {
+                if !ferrox_whpx::available() {
+                    return Err(format!(
+                        "the Windows Hypervisor Platform is not available. {}",
+                        virtualization_help()
+                    ));
+                }
+                mem.load(GDT_ADDR as u64, &ferrox_whpx::flat_gdt()).map_err(|e| e.to_string())?;
+                let slots = mem.mem_slots();
+                // SAFETY: as for KVM above.
+                let cpu = unsafe { ferrox_whpx::WhpCpu::new(&slots, entry, GDT_ADDR) }
+                    .map_err(|e| e.to_string())?;
+                Ok(Box::new(cpu))
+            }
+            #[cfg(not(any(target_os = "linux", windows)))]
             {
                 let _ = (mem, entry);
-                Err("hardware virtualization backends for this platform are not written yet".into())
+                Err(virtualization_help().into())
             }
         }
     }

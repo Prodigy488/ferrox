@@ -15,3 +15,6 @@ ferrox-machine = { path = "../ferrox-machine" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ferrox-kvm = { path = "../ferrox-kvm" }
+
+[target.'cfg(windows)'.dependencies]
+ferrox-whpx = { path = "../ferrox-whpx" }

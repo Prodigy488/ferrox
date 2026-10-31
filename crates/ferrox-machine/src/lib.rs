@@ -35,10 +35,64 @@ pub trait PortDevice: Send {
     fn io_out(&mut self, port: u16, size: usize, value: u64);
 }
 
+/// Zeroed host memory aligned to 4 KiB, as hypervisors require for guest memory
+/// (a plain `Vec<u8>` is only guaranteed 1-byte alignment).
+pub struct PageBuf {
+    ptr: std::ptr::NonNull<u8>,
+    len: usize,
+}
+
+const PAGE_ALIGN: usize = 4096;
+
+impl PageBuf {
+    pub fn zeroed(len: usize) -> PageBuf {
+        let size = len.max(1).next_multiple_of(PAGE_ALIGN);
+        let layout = std::alloc::Layout::from_size_align(size, PAGE_ALIGN).expect("layout");
+        // SAFETY: layout has non-zero size.
+        let raw = unsafe { std::alloc::alloc_zeroed(layout) };
+        let ptr = std::ptr::NonNull::new(raw).unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
+        PageBuf { ptr, len }
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> PageBuf {
+        let mut b = PageBuf::zeroed(bytes.len());
+        b.copy_from_slice(bytes);
+        b
+    }
+}
+
+impl std::ops::Deref for PageBuf {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        // SAFETY: ptr is valid for len bytes for the life of self.
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl std::ops::DerefMut for PageBuf {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as above, and we hold &mut self.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl Drop for PageBuf {
+    fn drop(&mut self) {
+        let size = self.len.max(1).next_multiple_of(PAGE_ALIGN);
+        let layout = std::alloc::Layout::from_size_align(size, PAGE_ALIGN).expect("layout");
+        // SAFETY: allocated in `zeroed` with this same layout.
+        unsafe { std::alloc::dealloc(self.ptr.as_ptr(), layout) }
+    }
+}
+
+// SAFETY: PageBuf uniquely owns its allocation, like Box<[u8]>.
+unsafe impl Send for PageBuf {}
+unsafe impl Sync for PageBuf {}
+
 enum Backing {
-    Ram(Vec<u8>),
+    Ram(PageBuf),
     /// Read-only bytes; shared so a ROM can appear at several mirrored addresses.
-    Rom(Arc<Vec<u8>>),
+    Rom(Arc<PageBuf>),
     Mmio(Box<dyn Mmio>),
 }
 
@@ -129,7 +183,7 @@ impl PhysMem {
                 Backing::Rom(v) => Some(MemSlot {
                     guest_addr: r.base,
                     size: r.size,
-                    host_ptr: v.as_ptr() as *mut u8,
+                    host_ptr: v.as_ptr() as *mut u8, // read-only slot: never written through
                     read_only: true,
                 }),
                 Backing::Mmio(_) => None,
@@ -138,12 +192,12 @@ impl PhysMem {
     }
 
     pub fn add_ram(&mut self, base: u64, size: usize) -> Result<(), MapError> {
-        self.insert(base, size as u64, Backing::Ram(vec![0; size]))
+        self.insert(base, size as u64, Backing::Ram(PageBuf::zeroed(size)))
     }
 
     pub fn add_rom(&mut self, base: u64, data: Vec<u8>) -> Result<(), MapError> {
         let size = data.len() as u64;
-        self.insert(base, size, Backing::Rom(Arc::new(data)))
+        self.insert(base, size, Backing::Rom(Arc::new(PageBuf::from_bytes(&data))))
     }
 
     /// Maps `data` repeatedly so that it fills `[ROM_TOP + 1 - span, ROM_TOP]`,
@@ -154,7 +208,7 @@ impl PhysMem {
         if len == 0 || span % len != 0 {
             return Err(MapError::Empty);
         }
-        let shared = Arc::new(data);
+        let shared = Arc::new(PageBuf::from_bytes(&data));
         let start = map::ROM_TOP + 1 - span;
         let mut base = start;
         while base <= map::ROM_TOP {
@@ -274,6 +328,7 @@ mod slot_tests {
         assert_eq!(slots.len(), 3);
         assert!(!slots[0].read_only && slots[1..].iter().all(|s| s.read_only));
         assert_eq!(slots[1].host_ptr, slots[2].host_ptr, "mirrors share bytes");
+        assert!(slots.iter().all(|s| s.host_ptr as usize % 4096 == 0), "hypervisors need page-aligned memory");
     }
 }
 

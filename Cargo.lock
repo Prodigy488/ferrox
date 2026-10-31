@@ -839,6 +839,17 @@ dependencies = [
  "ferrox-hle",
  "ferrox-kvm",
  "ferrox-machine",
+ "ferrox-whpx",
+]
+
+[[package]]
+name = "ferrox-whpx"
+version = "0.1.0"
+dependencies = [
+ "ferrox-core",
+ "ferrox-cpu",
+ "ferrox-machine",
+ "windows",
 ]
 
 [[package]]

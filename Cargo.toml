@@ -8,6 +8,7 @@ members = [
     "crates/ferrox-nv2a",
     "crates/ferrox-hle",
     "crates/ferrox-kvm",
+    "crates/ferrox-whpx",
     "crates/ferrox-system",
     "crates/ferrox-app",
     "crates/ferrox-cli",

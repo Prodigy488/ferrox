@@ -87,6 +87,9 @@ impl KvmCpu {
         let kvm = Kvm::new().map_err(err("open /dev/kvm"))?;
         let vm = kvm.create_vm().map_err(err("create VM"))?;
         for (i, s) in slots.iter().enumerate() {
+            if s.guest_addr % 4096 != 0 || s.size % 4096 != 0 || s.host_ptr as usize % 4096 != 0 {
+                return Err(KvmError(format!("memory region {:#x}+{:#x} is not page aligned", s.guest_addr, s.size)));
+            }
             let region = kvm_userspace_memory_region {
                 slot: i as u32,
                 flags: if s.read_only { KVM_MEM_READONLY } else { 0 },

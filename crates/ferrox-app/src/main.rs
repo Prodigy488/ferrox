@@ -294,10 +294,10 @@ impl App {
 
             ui.heading("Processor");
             if self.kvm {
-                ui.label(RichText::new("Hardware virtualization available (KVM). Games run on the real CPU at full speed.").color(ACCENT));
+                ui.label(RichText::new("Hardware virtualization available. Programs run on the real CPU at full speed.").color(ACCENT));
             } else {
                 ui.label(RichText::new("Hardware virtualization is not available on this computer.").color(BAD));
-                ui.label(RichText::new("On Linux, enable virtualization in the BIOS/UEFI and join the 'kvm' group. Windows (WHPX) and macOS (HVF) support is planned.").color(MUTED));
+                ui.label(RichText::new(ferrox_system::virtualization_help()).color(MUTED));
             }
             dirty |= ui
                 .checkbox(&mut self.settings.use_reference_cpu, "Use the slow test interpreter (development only; cannot run real games)")
@@ -378,14 +378,14 @@ impl App {
         ui.add_space(8.0);
         ui.label(RichText::new("What works today").strong());
         ui.label("• Opens disc images and executables, builds formatted hard-drive images");
-        ui.label("• Runs a program's own code on the real CPU (Linux/KVM) with the kernel provided in software");
+        ui.label("• Runs a program's own code on the real CPU (Linux KVM, Windows Hypervisor Platform) with the kernel provided in software");
         let (done, total) = ferrox_system::kernel_coverage();
         ui.label(format!("• The built-in kernel implements {done} of {total} functions (memory, debug text, time, shutdown)"));
         ui.add_space(8.0);
         ui.label(RichText::new("Not built yet").strong().color(WARN));
         ui.label("• Graphics (NV2A), audio, USB controllers, networking, file access — so commercial games cannot run");
-        ui.label("• BIOS boot mode, Windows and macOS CPU backends");
-        ui.label("• The hardware-virtualization backend has not yet been run on a real KVM host");
+        ui.label("• BIOS boot mode, macOS CPU backend");
+        ui.label("• The KVM and Windows hypervisor backends compile but have not been run on real machines yet");
     }
 }
 
