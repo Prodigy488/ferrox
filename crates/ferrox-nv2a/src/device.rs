@@ -41,6 +41,7 @@ pub struct Shared {
     log: Mutex<Vec<String>>,
     methods: AtomicU64,
     clears: AtomicU64,
+    triangles: AtomicU64,
 }
 
 impl Shared {
@@ -84,6 +85,15 @@ impl Shared {
 
     pub(crate) fn count_method(&self) {
         self.methods.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn count_triangle(&self) {
+        self.triangles.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Triangles the renderer has drawn.
+    pub fn triangles(&self) -> u64 {
+        self.triangles.load(Ordering::Relaxed)
     }
 
     pub(crate) fn count_clear(&self) {

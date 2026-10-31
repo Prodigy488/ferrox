@@ -381,7 +381,10 @@ pub fn run(
     }
     let (methods, clears) = gpu_state.gpu_counts();
     if methods > 0 {
-        say(&format!("[ferrox] GPU ran {methods} commands ({clears} surface clears)\n"));
+        say(&format!(
+            "[ferrox] GPU ran {methods} commands ({clears} surface clears, {} triangles)\n",
+            gpu_state.triangles()
+        ));
     }
     Ok(Report { outcome, backend, title })
 }
@@ -453,8 +456,8 @@ pub fn demo_xbe() -> Vec<u8> {
 }
 
 /// Machine code for the demo's GPU part: describes a few objects to the GPU,
-/// sends it a command buffer that draws two filled rectangles over the
-/// gradient, and prints how many command bytes the GPU consumed.
+/// sends it a command buffer that draws two filled rectangles and a
+/// colour-blended triangle over the gradient, and prints how many command bytes the GPU consumed.
 /// `ebx` holds the framebuffer address.
 fn gpu_demo(c: &mut Vec<u8>, call_dbgprint: Vec<u8>, push_fmt: Vec<u8>) {
     use ferrox_nv2a::gpu::{ramht_hash, KELVIN_CLASS};
@@ -502,6 +505,13 @@ fn gpu_demo(c: &mut Vec<u8>, call_dbgprint: Vec<u8>, push_fmt: Vec<u8>) {
     for (x0, x1, y0, y1, colour) in [(100u32, 539u32, 80u32, 399u32, 0xFFE0_8020u32), (180, 459, 140, 339, 0xFF10_2060)] {
         put(&[hdr(0x1D98, 2), x0 | (x1 << 16), y0 | (y1 << 16), hdr(0x1D90, 1), colour, hdr(0x1D94, 1), 0xF0]);
     }
+    // a triangle with red, green and blue corners inside the inner rectangle
+    let mut put = |ws: &[u32]| words.extend(ws.iter().map(|&w| Some(w)));
+    put(&[hdr(0x17FC, 1), 5]);
+    for (x, y, argb) in [(320.0f32, 160.0f32, 0xFFFF_0000u32), (220.0, 320.0, 0xFF00_FF00), (420.0, 320.0, 0xFF00_00FF)] {
+        put(&[hdr(0x194C, 1), argb, hdr(0x1A00, 4), x.to_bits(), y.to_bits(), 0, 1.0f32.to_bits()]);
+    }
+    put(&[hdr(0x17FC, 1), 0]);
     for (i, w) in words.iter().enumerate() {
         let at = PUSHBUF + 4 * i as u32;
         match w {
@@ -546,10 +556,11 @@ mod tests {
         let mut frames = Vec::new();
         let rep = run(&cfg, &Arc::new(AtomicBool::new(false)), |s| out.push_str(s), |f| frames.push(f)).unwrap();
         let game_out: String = out.lines().filter(|l| !l.starts_with("[ferrox]")).map(|l| format!("{l}\n")).collect();
-        assert_eq!(game_out, "gpu id: 02a000a3\ngpu took 108 bytes of commands\nhello, xbox! (test pattern drawn)\n");
+        assert_eq!(game_out, "gpu id: 02a000a3\ngpu took 208 bytes of commands\nhello, xbox! (test pattern drawn)\n");
         assert!(out.contains("display set: 640x480"), "{out}");
         assert!(out.contains("gpu id: 02a000a3"), "{out}");
-        assert!(!out.contains("not emulated yet"), "the demo only uses implemented registers: {out}");
+        assert!(!out.contains("registers touched but not emulated"), "the demo only uses implemented registers: {out}");
+        assert!(out.contains("GPU work not emulated yet: vertex program not run"), "the gap is reported: {out}");
         assert!(out.contains("CPU: reference"), "{out}");
         let last = frames.last().expect("the demo displays a picture");
         assert_eq!((last.width, last.height), (640, 480));
@@ -558,9 +569,14 @@ mod tests {
         assert_ne!(&last.rgba[0..4], &last.rgba[last.rgba.len() - 4..], "the pattern varies across the screen");
         let px = |x: usize, y: usize| last.rgba[(y * 640 + x) * 4..][..4].to_vec();
         assert_eq!(px(150, 100), [0xE0, 0x80, 0x20, 0xFF], "outer rectangle drawn by the GPU");
-        assert_eq!(px(320, 240), [0x10, 0x20, 0x60, 0xFF], "inner rectangle drawn by the GPU");
+        assert_eq!(px(200, 240), [0x10, 0x20, 0x60, 0xFF], "inner rectangle drawn by the GPU");
         assert_ne!(px(99, 100), [0xE0, 0x80, 0x20, 0xFF], "outside the rectangle is still the gradient");
-        assert!(out.contains("GPU ran 15 commands (2 surface clears)"), "{out}");
+        let top = px(320, 170);
+        assert!(top[0] > 0xC0 && top[1] < 0x40 && top[2] < 0x40, "triangle is red near its top corner: {top:?}");
+        let mid = px(320, 280);
+        assert!(mid[0] > 0x10 && mid[1] > 0x20 && mid[2] > 0x20, "colours blend inside the triangle: {mid:?}");
+        assert_eq!(px(200, 160), [0x10, 0x20, 0x60, 0xFF], "outside the triangle is still the inner rectangle");
+        assert!(out.contains("GPU ran 32 commands (2 surface clears, 1 triangles)"), "{out}");
         assert_eq!(rep.outcome, Outcome::GuestStopped("HalReturnToFirmware(0)".into()));
         assert!(rep.backend.starts_with("reference"));
         std::fs::remove_dir_all(&dir).unwrap();

@@ -8,6 +8,7 @@
 //! front end's report instead of silently doing nothing.
 
 use crate::device::Shared;
+use crate::raster::{self, Surface, Vertex};
 use crate::{decode, Command};
 use ferrox_machine::RamView;
 use std::collections::BTreeMap;
@@ -57,6 +58,17 @@ const NV097_SET_COLOR_CLEAR_VALUE: u32 = 0x1D90;
 const NV097_CLEAR_SURFACE: u32 = 0x1D94;
 const NV097_SET_CLEAR_RECT_HORIZONTAL: u32 = 0x1D98;
 const NV097_SET_CLEAR_RECT_VERTICAL: u32 = 0x1D9C;
+const NV097_SET_BEGIN_END: u32 = 0x17FC;
+const NV097_SET_VERTEX_DATA2F_M: u32 = 0x1880;
+const NV097_SET_VERTEX_DATA4UB: u32 = 0x1940;
+const NV097_SET_VERTEX_DATA4F_M: u32 = 0x1A00;
+const ATTR_DIFFUSE: usize = 3;
+const PRIM_TRIANGLES: u32 = 5;
+const PRIM_TRIANGLE_STRIP: u32 = 6;
+const PRIM_TRIANGLE_FAN: u32 = 7;
+const PRIM_QUADS: u32 = 8;
+const PRIM_QUAD_STRIP: u32 = 9;
+const PRIM_POLYGON: u32 = 10;
 pub const KELVIN_CLASS: u32 = 0x97;
 
 /// Where the RAMHT hash of `handle` lands (an entry is 8 bytes). `size_field` is
@@ -93,6 +105,11 @@ pub struct Gpu {
     bound: [u32; 8],
     kelvin: BTreeMap<u32, u32>,
     color_base: u32,
+    /// Current value of each of the 16 vertex attributes (position is 0, diffuse 3).
+    attrs: [[f32; 4]; 16],
+    /// Primitive type between Begin and End, 0 outside.
+    prim: u32,
+    verts: Vec<Vertex>,
 }
 
 impl Gpu {
@@ -107,7 +124,16 @@ impl Gpu {
             bound: [0; 8],
             kelvin: BTreeMap::new(),
             color_base: 0,
+            attrs: Self::initial_attrs(),
+            prim: 0,
+            verts: Vec::new(),
         }
+    }
+
+    fn initial_attrs() -> [[f32; 4]; 16] {
+        let mut a = [[0.0, 0.0, 0.0, 1.0]; 16];
+        a[ATTR_DIFFUSE] = [1.0; 4]; // white until a program sets a colour
+        a
     }
 
     pub fn attach_ram(&mut self, ram: RamView) {
@@ -326,12 +352,119 @@ impl Gpu {
                 self.kelvin.insert(m, v);
             }
             NV097_CLEAR_SURFACE => self.clear_surface(v),
+            NV097_SET_BEGIN_END => self.begin_end(v),
+            NV097_SET_VERTEX_DATA2F_M..=0x18FF => {
+                let slot = ((m - NV097_SET_VERTEX_DATA2F_M) / 4) as usize;
+                let (attr, comp) = (slot / 2, slot % 2);
+                self.attrs[attr][comp] = f32::from_bits(v);
+                if comp == 1 {
+                    self.attrs[attr][2] = 0.0;
+                    self.attrs[attr][3] = 1.0;
+                    if attr == 0 {
+                        self.emit_vertex();
+                    }
+                }
+            }
+            NV097_SET_VERTEX_DATA4UB..=0x197F => {
+                let attr = ((m - NV097_SET_VERTEX_DATA4UB) / 4) as usize;
+                // packed as the Direct3D colour A, R, G, B
+                self.attrs[attr] = [
+                    ((v >> 16) & 0xFF) as f32 / 255.0,
+                    ((v >> 8) & 0xFF) as f32 / 255.0,
+                    (v & 0xFF) as f32 / 255.0,
+                    (v >> 24) as f32 / 255.0,
+                ];
+                if attr == 0 {
+                    self.emit_vertex();
+                }
+            }
+            NV097_SET_VERTEX_DATA4F_M..=0x1BFF => {
+                let slot = ((m - NV097_SET_VERTEX_DATA4F_M) / 4) as usize;
+                let (attr, comp) = (slot / 4, slot % 4);
+                self.attrs[attr][comp] = f32::from_bits(v);
+                if attr == 0 && comp == 3 {
+                    self.emit_vertex();
+                }
+            }
             _ => self.shared.gap(format!("graphics method {m:#x}")),
         }
     }
 
     fn k(&self, m: u32) -> u32 {
         self.kelvin.get(&m).copied().unwrap_or(0)
+    }
+
+    /// The colour surface as currently set up, if it is one the renderer can draw to.
+    fn surface(&self) -> Option<Surface> {
+        let ram = self.ram?;
+        let clip_h = self.k(NV097_SET_SURFACE_CLIP_HORIZONTAL);
+        let clip_v = self.k(NV097_SET_SURFACE_CLIP_VERTICAL);
+        Some(Surface {
+            ram,
+            origin: self.color_base as u64 + self.k(NV097_SET_SURFACE_COLOR_OFFSET) as u64,
+            pitch: (self.k(NV097_SET_SURFACE_PITCH) & 0xFFFF) as u64,
+            format: self.k(NV097_SET_SURFACE_FORMAT) & 0xF,
+            clip: (clip_h & 0xFFFF, clip_v & 0xFFFF, clip_h >> 16, clip_v >> 16),
+        })
+    }
+
+    fn begin_end(&mut self, op: u32) {
+        if op != 0 {
+            self.prim = op;
+            self.verts.clear();
+            return;
+        }
+        let verts = std::mem::take(&mut self.verts);
+        let prim = std::mem::replace(&mut self.prim, 0);
+        let mut tris: Vec<[usize; 3]> = Vec::new();
+        let n = verts.len();
+        match prim {
+            PRIM_TRIANGLES => tris.extend((0..n / 3).map(|i| [3 * i, 3 * i + 1, 3 * i + 2])),
+            PRIM_TRIANGLE_STRIP => tris.extend((0..n.saturating_sub(2)).map(|i| {
+                if i % 2 == 0 { [i, i + 1, i + 2] } else { [i + 1, i, i + 2] }
+            })),
+            PRIM_TRIANGLE_FAN | PRIM_POLYGON => tris.extend((1..n.saturating_sub(1)).map(|i| [0, i, i + 1])),
+            PRIM_QUADS => {
+                for q in 0..n / 4 {
+                    let b = 4 * q;
+                    tris.push([b, b + 1, b + 2]);
+                    tris.push([b, b + 2, b + 3]);
+                }
+            }
+            PRIM_QUAD_STRIP => {
+                for q in 0..n.saturating_sub(2) / 2 {
+                    let b = 2 * q;
+                    tris.push([b, b + 1, b + 3]);
+                    tris.push([b, b + 3, b + 2]);
+                }
+            }
+            0 => return,
+            p => {
+                self.shared.gap(format!("drawing primitive type {p}"));
+                return;
+            }
+        }
+        if tris.is_empty() {
+            return;
+        }
+        let Some(surface) = self.surface() else { return };
+        if raster::bytes_per_pixel(surface.format).is_none() {
+            self.shared.gap(format!("drawing into a colour surface of format {:#x}", surface.format));
+            return;
+        }
+        self.shared.gap("vertex program not run: positions are used as screen coordinates".into());
+        for t in tris {
+            raster::fill_triangle(&surface, [verts[t[0]], verts[t[1]], verts[t[2]]]);
+            self.shared.count_triangle();
+        }
+    }
+
+    fn emit_vertex(&mut self) {
+        if self.prim == 0 {
+            return;
+        }
+        let (p, c) = (self.attrs[0], self.attrs[ATTR_DIFFUSE]);
+        self.verts.push(Vertex { x: p[0], y: p[1], color: c });
     }
 
     fn clear_surface(&mut self, flags: u32) {
@@ -570,5 +703,72 @@ mod tests {
         assert_eq!(g.read(0x70_0010, 4), 0x1122_3344);
         assert_eq!(g.read(0x70_0011, 1), 0x33);
         assert_eq!(g.read(0x70_0012, 2), 0x1122);
+    }
+
+    fn f(v: f32) -> u32 {
+        v.to_bits()
+    }
+
+    fn setup_surface() -> Vec<u32> {
+        vec![
+            hdr(0, 1), KELVIN, hdr(0x194, 1), COLOR_DMA, hdr(0x200, 2), 64 << 16, 32 << 16,
+            hdr(0x208, 1), 0x108, hdr(0x20C, 2), 256, FB,
+        ]
+    }
+
+    fn vertex(x: f32, y: f32, argb: u32) -> Vec<u32> {
+        vec![hdr(0x1940 + 4 * 3, 1), argb, hdr(0x1A00, 4), f(x), f(y), f(0.0), f(1.0)]
+    }
+
+    #[test]
+    fn draws_a_triangle_from_immediate_vertices() {
+        let (mut g, shared, mut mem) = setup();
+        init(&mut g);
+        let mut w = setup_surface();
+        w.extend([hdr(0x17FC, 1), 5]);
+        w.extend(vertex(4.0, 4.0, 0xFFFF_0000));
+        w.extend(vertex(60.0, 4.0, 0xFF00_FF00));
+        w.extend(vertex(4.0, 28.0, 0xFF00_00FF));
+        w.extend([hdr(0x17FC, 1), 0]);
+        kick(&mut g, &mut mem, &w);
+        assert_eq!(shared.triangles(), 1);
+        assert!(pixel(&mut mem, 5, 5) >> 16 & 0xFF > 0xE0, "mostly red near the red corner");
+        assert_eq!(pixel(&mut mem, 62, 30), 0, "outside the triangle");
+        assert!(pixel(&mut mem, 20, 10) != 0);
+        // one gap is recorded, and it says what is missing
+        let gaps = shared.gaps();
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert!(gaps[0].0.contains("vertex program"), "{gaps:?}");
+    }
+
+    #[test]
+    fn strips_fans_and_quads_expand_to_triangles() {
+        for (prim, n, expect) in [(6u32, 5, 3), (7, 5, 3), (8, 8, 4), (5, 7, 2), (9, 6, 4), (10, 4, 2)] {
+            let (mut g, shared, mut mem) = setup();
+            init(&mut g);
+            let mut w = setup_surface();
+            w.extend([hdr(0x17FC, 1), prim]);
+            for i in 0..n {
+                w.extend(vertex(2.0 + (i * 5 % 17) as f32, 2.0 + (i * 7 % 13) as f32, 0xFFFF_FFFF));
+            }
+            w.extend([hdr(0x17FC, 1), 0]);
+            kick(&mut g, &mut mem, &w);
+            assert_eq!(shared.triangles(), expect, "primitive {prim} with {n} vertices");
+        }
+    }
+
+    #[test]
+    fn vertices_outside_begin_end_and_unsupported_primitives_are_not_drawn() {
+        let (mut g, shared, mut mem) = setup();
+        init(&mut g);
+        let mut w = setup_surface();
+        w.extend(vertex(1.0, 1.0, 0xFFFF_FFFF)); // no Begin
+        w.extend([hdr(0x17FC, 1), 2]); // lines
+        w.extend(vertex(1.0, 1.0, 0xFFFF_FFFF));
+        w.extend(vertex(9.0, 9.0, 0xFFFF_FFFF));
+        w.extend([hdr(0x17FC, 1), 0]);
+        kick(&mut g, &mut mem, &w);
+        assert_eq!(shared.triangles(), 0);
+        assert!(shared.gaps().iter().any(|(k, _)| k.contains("primitive type 2")), "{:?}", shared.gaps());
     }
 }
