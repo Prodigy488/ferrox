@@ -149,11 +149,25 @@ impl CpuBackend for RefCpu {
                     let (md, reg, rm) = (modrm >> 6, ((modrm >> 3) & 7) as usize, (modrm & 7) as usize);
                     match md {
                         3 => self.regs.gpr[rm] = self.regs.gpr[reg],
-                        0 if rm != 4 && rm != 5 => {
+                        0 if rm == 5 => {
+                            let a = self.fetch32(bus)?;
+                            bus.write(a as u64, 4, self.regs.gpr[reg] as u64)?
+                        }
+                        0 if rm != 4 => {
                             bus.write(self.regs.gpr[rm] as u64, 4, self.regs.gpr[reg] as u64)?
                         }
                         _ => return Err(CpuError::Unimplemented { eip: at, opcode: op }),
                     }
+                }
+                0xC7 => {
+                    // mov dword [disp32], imm32
+                    let modrm = self.fetch8(bus)?;
+                    if modrm != 0x05 {
+                        return Err(CpuError::Unimplemented { eip: at, opcode: op });
+                    }
+                    let a = self.fetch32(bus)?;
+                    let v = self.fetch32(bus)?;
+                    bus.write(a as u64, 4, v as u64)?;
                 }
                 0xB8..=0xBF => {
                     let v = self.fetch32(bus)?;

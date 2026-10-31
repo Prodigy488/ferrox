@@ -18,7 +18,7 @@ hard-drive images, CLI `run`/`hdd`/`demo`.
 2. Kernel: threads and scheduling, events/semaphores/mutexes, DPCs and interrupts,
    file access (`NtCreateFile` and friends over the disc image and FATX drive E:).
 3. A homebrew program built with nxdk that only uses text output runs end to end.
-4. Then M3/M4 below (GPU) — nothing draws until then.
+4. Then M3/M4 below (GPU). Done so far: the command queue and colour clears; next are triangles (vertex setup, a software rasteriser first, then Vulkan), shaders and textures.
 5. WHPX (Windows) and HVF (macOS) backends; qcow2 reading for xemu-made images.
 
 ## M1 — Run guest code

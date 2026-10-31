@@ -282,7 +282,8 @@ pub fn run(
 
     let mut mem = PhysMem::new();
     mem.add_ram(0, RAM_BYTES).map_err(|e| e.to_string())?;
-    let (gpu, gpu_state) = ferrox_nv2a::device::Nv2a::new();
+    let (mut gpu, gpu_state) = ferrox_nv2a::device::Nv2a::new();
+    gpu.attach_ram(mem.ram_view(0).ok_or("no memory to give the GPU")?);
     mem.add_mmio(ferrox_nv2a::device::BASE, ferrox_nv2a::device::SIZE, Box::new(gpu))
         .map_err(|e| e.to_string())?;
     let mut hle = KernelHle::with_table();
@@ -366,6 +367,22 @@ pub fn run(
             if missed.len() > 12 { ", ..." } else { "" }
         ));
     }
+    for problem in gpu_state.take_log() {
+        say(&format!("[ferrox] GPU: {problem}\n"));
+    }
+    let gaps = gpu_state.gaps();
+    if !gaps.is_empty() {
+        let list: Vec<String> = gaps.iter().take(12).map(|(what, n)| format!("{what} x{n}")).collect();
+        say(&format!(
+            "[ferrox] GPU work not emulated yet: {}{}\n",
+            list.join("; "),
+            if gaps.len() > 12 { "; ..." } else { "" }
+        ));
+    }
+    let (methods, clears) = gpu_state.gpu_counts();
+    if methods > 0 {
+        say(&format!("[ferrox] GPU ran {methods} commands ({clears} surface clears)\n"));
+    }
     Ok(Report { outcome, backend, title })
 }
 
@@ -418,6 +435,7 @@ pub fn demo_xbe() -> Vec<u8> {
     c.extend([0x89, 0xD8]); // mov eax, ebx
     c.push(0xA3);
     c.extend_from_slice(&0xFD60_0800u32.to_le_bytes()); // mov [PCRTC_START], eax
+    gpu_demo(&mut c, call(0), push(BASE + 0x20C0));
     c.extend(push(BASE + 0x2040));
     c.extend(call(0)); // DbgPrint(greeting)
     c.extend([0x83, 0xC4, 0x04]);
@@ -429,7 +447,79 @@ pub fn demo_xbe() -> Vec<u8> {
     file[0x2040..0x2040 + GREETING.len()].copy_from_slice(GREETING);
     const GPU_FMT: &[u8] = b"gpu id: %08x\n\0";
     file[0x2080..0x2080 + GPU_FMT.len()].copy_from_slice(GPU_FMT);
+    const GPU_DONE: &[u8] = b"gpu took %d bytes of commands\n\0";
+    file[0x20C0..0x20C0 + GPU_DONE.len()].copy_from_slice(GPU_DONE);
     file
+}
+
+/// Machine code for the demo's GPU part: describes a few objects to the GPU,
+/// sends it a command buffer that draws two filled rectangles over the
+/// gradient, and prints how many command bytes the GPU consumed.
+/// `ebx` holds the framebuffer address.
+fn gpu_demo(c: &mut Vec<u8>, call_dbgprint: Vec<u8>, push_fmt: Vec<u8>) {
+    use ferrox_nv2a::gpu::{ramht_hash, KELVIN_CLASS};
+    const RAMIN: u32 = 0xFD70_0000;
+    const REGS: u32 = 0xFD00_0000;
+    const KELVIN: u32 = 0xB0B0;
+    const COLOR_DMA: u32 = 0xC0DE;
+    const PUSHBUF: u32 = 0x03F0_0000;
+    let st = |c: &mut Vec<u8>, addr: u32, val: u32| {
+        c.extend([0xC7, 0x05]); // mov dword [addr], imm32
+        c.extend(addr.to_le_bytes());
+        c.extend(val.to_le_bytes());
+    };
+    // the hash table: handle -> object instance (in 16-byte units)
+    for (handle, instance) in [(KELVIN, 0x1020u32), (COLOR_DMA, 0x1010)] {
+        let slot = ramht_hash(handle, 0, 0) * 8;
+        st(c, RAMIN + slot, handle);
+        st(c, RAMIN + slot + 4, 0x8000_0000 | (instance >> 4));
+    }
+    // DMA objects: the command buffer, and all of memory for the picture
+    for (inst, base, limit) in [(0x1000u32, PUSHBUF, 0xFFFFu32), (0x1010, 0, 0x03FF_FFFF)] {
+        st(c, RAMIN + inst, 0x3D);
+        st(c, RAMIN + inst + 4, limit);
+        st(c, RAMIN + inst + 8, base | 3);
+    }
+    st(c, RAMIN + 0x1020, KELVIN_CLASS); // the 3D engine object
+    for (reg, v) in [
+        (0x2210u32, 0u32), // RAMHT: at 0, 4 KiB
+        (0x3204, 0x100),   // channel 0, DMA mode
+        (0x322C, 0x1000 >> 4), // command-buffer DMA object
+        (0x3200, 1),       // let the pusher fetch
+        (0x3220, 1),
+        (0x3250, 1),       // let the puller run
+    ] {
+        st(c, REGS + reg, v);
+    }
+    let hdr = |method: u32, count: u32| (count << 18) | method;
+    // the command buffer; `None` marks the framebuffer address, known only at run time
+    let mut words: Vec<Option<u32>> = Vec::new();
+    let mut put = |ws: &[u32]| words.extend(ws.iter().map(|&w| Some(w)));
+    put(&[hdr(0, 1), KELVIN, hdr(0x194, 1), COLOR_DMA, hdr(0x200, 2), 640 << 16, 480 << 16]);
+    put(&[hdr(0x208, 1), 0x108, hdr(0x20C, 1), 2560, hdr(0x210, 1)]);
+    words.push(None); // colour offset = framebuffer address
+    let mut put = |ws: &[u32]| words.extend(ws.iter().map(|&w| Some(w)));
+    for (x0, x1, y0, y1, colour) in [(100u32, 539u32, 80u32, 399u32, 0xFFE0_8020u32), (180, 459, 140, 339, 0xFF10_2060)] {
+        put(&[hdr(0x1D98, 2), x0 | (x1 << 16), y0 | (y1 << 16), hdr(0x1D90, 1), colour, hdr(0x1D94, 1), 0xF0]);
+    }
+    for (i, w) in words.iter().enumerate() {
+        let at = PUSHBUF + 4 * i as u32;
+        match w {
+            Some(v) => st(c, at, *v),
+            None => {
+                c.extend([0x89, 0x1D]); // mov [at], ebx
+                c.extend(at.to_le_bytes());
+            }
+        }
+    }
+    let bytes = 4 * words.len() as u32;
+    st(c, 0xFD80_0040, bytes); // USER DMA_PUT: go
+    c.push(0xA1);
+    c.extend(0xFD80_0044u32.to_le_bytes()); // eax = DMA_GET
+    c.push(0x50);
+    c.extend(push_fmt);
+    c.extend(call_dbgprint);
+    c.extend([0x83, 0xC4, 0x08]);
 }
 
 #[cfg(test)]
@@ -456,7 +546,7 @@ mod tests {
         let mut frames = Vec::new();
         let rep = run(&cfg, &Arc::new(AtomicBool::new(false)), |s| out.push_str(s), |f| frames.push(f)).unwrap();
         let game_out: String = out.lines().filter(|l| !l.starts_with("[ferrox]")).map(|l| format!("{l}\n")).collect();
-        assert_eq!(game_out, "gpu id: 02a000a3\nhello, xbox! (test pattern drawn)\n");
+        assert_eq!(game_out, "gpu id: 02a000a3\ngpu took 108 bytes of commands\nhello, xbox! (test pattern drawn)\n");
         assert!(out.contains("display set: 640x480"), "{out}");
         assert!(out.contains("gpu id: 02a000a3"), "{out}");
         assert!(!out.contains("not emulated yet"), "the demo only uses implemented registers: {out}");
@@ -466,6 +556,11 @@ mod tests {
         assert_eq!(last.rgba.len(), 640 * 480 * 4);
         assert_eq!(&last.rgba[0..8], &[0, 0, 0, 255, 1, 2, 3, 255]);
         assert_ne!(&last.rgba[0..4], &last.rgba[last.rgba.len() - 4..], "the pattern varies across the screen");
+        let px = |x: usize, y: usize| last.rgba[(y * 640 + x) * 4..][..4].to_vec();
+        assert_eq!(px(150, 100), [0xE0, 0x80, 0x20, 0xFF], "outer rectangle drawn by the GPU");
+        assert_eq!(px(320, 240), [0x10, 0x20, 0x60, 0xFF], "inner rectangle drawn by the GPU");
+        assert_ne!(px(99, 100), [0xE0, 0x80, 0x20, 0xFF], "outside the rectangle is still the gradient");
+        assert!(out.contains("GPU ran 15 commands (2 surface clears)"), "{out}");
         assert_eq!(rep.outcome, Outcome::GuestStopped("HalReturnToFirmware(0)".into()));
         assert!(rep.backend.starts_with("reference"));
         std::fs::remove_dir_all(&dir).unwrap();

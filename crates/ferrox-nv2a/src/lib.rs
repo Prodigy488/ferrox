@@ -10,6 +10,7 @@
 //! used for offline tools such as pushbuffer dumpers without any GPU state.
 
 pub mod device;
+pub mod gpu;
 
 use std::fmt;
 

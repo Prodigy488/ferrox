@@ -89,6 +89,57 @@ impl Drop for PageBuf {
 unsafe impl Send for PageBuf {}
 unsafe impl Sync for PageBuf {}
 
+/// A cloneable window onto guest RAM for devices that do their own memory access
+/// (the GPU reads command buffers and writes pixels). The memory belongs to the
+/// `PhysMem` that made the view and must outlive every use of it; devices are
+/// owned by that same `PhysMem`, so this holds in practice. As with real DMA,
+/// the guest CPU may be changing the same bytes; accesses are plain loads/stores.
+#[derive(Clone, Copy)]
+pub struct RamView {
+    ptr: *mut u8,
+    len: usize,
+    base: u64,
+}
+
+// SAFETY: see the type's documentation; the pointer is only dereferenced in bounds.
+unsafe impl Send for RamView {}
+unsafe impl Sync for RamView {}
+
+impl RamView {
+    /// Guest address of the first byte.
+    pub fn base(&self) -> u64 {
+        self.base
+    }
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    fn range(&self, addr: u64, len: usize) -> Option<usize> {
+        let off = addr.checked_sub(self.base)? as usize;
+        (off.checked_add(len)? <= self.len).then_some(off)
+    }
+    /// Borrows `len` bytes at guest address `addr`.
+    pub fn bytes(&self, addr: u64, len: usize) -> Option<&[u8]> {
+        let off = self.range(addr, len)?;
+        // SAFETY: in bounds of the allocation this view was made from.
+        Some(unsafe { std::slice::from_raw_parts(self.ptr.add(off), len) })
+    }
+    pub fn read_u32(&self, addr: u64) -> Option<u32> {
+        self.bytes(addr, 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+    }
+    pub fn write(&self, addr: u64, data: &[u8]) -> bool {
+        let Some(off) = self.range(addr, data.len()) else { return false };
+        // SAFETY: in bounds; source and destination cannot overlap (data is not RAM we hold a &mut to).
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.ptr.add(off), data.len()) };
+        true
+    }
+    pub fn write_u32(&self, addr: u64, v: u32) -> bool {
+        self.write(addr, &v.to_le_bytes())
+    }
+}
+
 enum Backing {
     Ram(PageBuf),
     /// Read-only bytes; shared so a ROM can appear at several mirrored addresses.
@@ -197,6 +248,16 @@ impl PhysMem {
         let (r, off) = self.find(addr, len)?;
         match &r.backing {
             Backing::Ram(v) => v.get(off as usize..off as usize + len),
+            _ => None,
+        }
+    }
+
+    /// A view of the RAM region that contains `addr`, for devices that access memory themselves.
+    pub fn ram_view(&mut self, addr: GuestAddr) -> Option<RamView> {
+        let (r, _) = self.find(addr, 1)?;
+        let base = r.base;
+        match &mut r.backing {
+            Backing::Ram(v) => Some(RamView { ptr: v.as_mut_ptr(), len: v.len(), base }),
             _ => None,
         }
     }
