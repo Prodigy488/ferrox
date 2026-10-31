@@ -185,6 +185,16 @@ const PTIMER_NUMERATOR: u64 = 0x9200;
 const PTIMER_DENOMINATOR: u64 = 0x9210;
 const PTIMER_TIME_0: u64 = 0x9400;
 const PTIMER_TIME_1: u64 = 0x9410;
+const PFB_CSTATUS: u64 = 0x10_020C;
+const PFB_WBC: u64 = 0x10_0410;
+const PVIDEO_STOP: u64 = 0x8704;
+const PRAMDAC_PLL_TEST_COUNTER: u64 = 0x68_0514;
+
+/// Blocks of the chip whose registers simply hold what is written (as in the reference
+/// emulator); everywhere else an unmodelled register reads as zero and ignores writes.
+fn plain_storage(offset: u64) -> bool {
+    matches!(offset, 0x8000..=0x8FFF | 0x10_0000..=0x10_0FFF | 0x40_0000..=0x40_0FFF | 0x68_0000..=0x68_0FFF)
+}
 /// The chip's core clock.
 const CORE_CLOCK_HZ: u128 = 233_333_333;
 
@@ -271,9 +281,16 @@ impl Nv2a {
                 self.status_toggle = !self.status_toggle;
                 if self.status_toggle { 0x09 } else { 0x00 }
             }
+            PFB_CSTATUS => 64 << 20, // the amount of video memory
+            PFB_WBC | PVIDEO_STOP => 0, // "flush not pending", "overlay stopped"
+            PRAMDAC_PLL_TEST_COUNTER => 0xF800_0000, // every PLL reports locked
             _ => {
                 self.shared.note(false, offset);
-                self.scratch.get(&(offset as u32)).copied().unwrap_or(0) as u64
+                if plain_storage(offset) {
+                    self.scratch.get(&(offset as u32)).copied().unwrap_or(0) as u64
+                } else {
+                    0
+                }
             }
         }
     }
@@ -302,7 +319,9 @@ impl Nv2a {
             PCRTC_START => self.shared.display_start.store(v & 0x07FF_FFFF, Ordering::Relaxed),
             _ => {
                 self.shared.note(true, offset);
-                self.scratch.insert(offset as u32, v);
+                if plain_storage(offset) {
+                    self.scratch.insert(offset as u32, v);
+                }
             }
         }
     }
@@ -321,8 +340,13 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(5));
         let b = d.read(PTIMER_TIME_0, 4);
         assert!(b > a, "the timer runs: {a:#x} then {b:#x}");
+        d.write(0x40_0750, 4, 0x1100);
+        assert_eq!(d.read(0x40_0750, 4), 0x1100, "a graphics register reads back");
         d.write(0x200, 4, 0x1100);
-        assert_eq!(d.read(0x200, 4), 0x1100, "an unmodelled register reads back");
+        assert_eq!(d.read(0x200, 4), 0, "the master control block does not");
+        d.write(0x10_0410, 4, 0x1_0000);
+        assert_eq!(d.read(0x10_0410, 4), 0, "a write-buffer flush is never pending");
+        assert_eq!(d.read(0x10_020C, 4), 64 << 20);
     }
 
     #[test]
