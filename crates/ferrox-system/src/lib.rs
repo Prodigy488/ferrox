@@ -590,6 +590,27 @@ pub fn run(
             let list: Vec<String> = hot.iter().map(|&(w, o, n)| format!("{} {o:#x} x{n}", if w { "write" } else { "read" })).collect();
             say(&format!("[probe] GPU registers touched most: {}\n", list.join(", ")));
         }
+        {
+            let irql = hle.sched.irql(&mut mem);
+            say(&format!(
+                "[probe] interrupt level now {irql}, deferred calls run {} and waiting {}\n",
+                hle.sched.dpcs_run,
+                hle.sched.dpcs_queued()
+            ));
+            let (pmc_en, crtc_en, crtc) = gpu_state.interrupt_state();
+            say(&format!("[probe] chip interrupt state: PMC enable {pmc_en:#x}, CRTC enable {crtc_en:#x}, CRTC pending {crtc:#x}\n"));
+            let accesses = gpu_state.interrupt_accesses();
+            if !accesses.is_empty() {
+                let list: Vec<String> = accesses.iter().map(|&(w, o, v)| format!("{}{o:#x}={v:#x}", if w { "W" } else { "R" })).collect();
+                say(&format!("[probe] last interrupt-register accesses (oldest first): {}\n", list.join(" ")));
+            }
+            let mut routines: Vec<(&str, u32)> = hle.sched.interrupts.values().filter(|i| i.connected).map(|i| ("interrupt handler", i.routine)).collect();
+            routines.extend(hle.sched.seen_dpcs.iter().map(|&r| ("deferred call", r)));
+            for (what, at) in routines {
+                let bytes: Vec<String> = (0..256u64).map(|i| format!("{:02x}", mem.read(at as u64 + i, 1).unwrap_or(0))).collect();
+                say(&format!("[probe] {what} code at {at:#x}: {}\n", bytes.join("")));
+            }
+        }
         let recent = gpu_state.recent_accesses();
         if !recent.is_empty() {
             let list: Vec<String> = recent.iter().map(|&(w, o, v)| format!("{}{o:#x}={v:#x}", if w { "W" } else { "R" })).collect();

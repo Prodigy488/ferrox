@@ -152,6 +152,9 @@ pub struct Sched {
     pub interrupt_time_addr: Option<u32>,
     calls_since_switch: u32,
     ready: bool,
+    /// Deferred calls started so far, and the routines the game has queued (for diagnostics).
+    pub dpcs_run: u64,
+    pub seen_dpcs: Vec<u32>,
 }
 
 impl Default for Sched {
@@ -176,6 +179,8 @@ impl Default for Sched {
             interrupt_time_addr: None,
             calls_since_switch: 0,
             ready: false,
+            dpcs_run: 0,
+            seen_dpcs: Vec::new(),
         }
     }
 }
@@ -530,6 +535,10 @@ impl Sched {
         wr(bus, dpc + DPC_ARG1, a1);
         wr(bus, dpc + DPC_ARG2, a2);
         wr(bus, dpc + DPC_INSERTED, 1);
+        let routine = rd(bus, dpc + DPC_ROUTINE);
+        if self.seen_dpcs.len() < 8 && !self.seen_dpcs.contains(&routine) {
+            self.seen_dpcs.push(routine);
+        }
         self.dpcs.push_back(dpc);
         true
     }
@@ -601,8 +610,13 @@ impl Sched {
             return false;
         }
         let args = [dpc, rd(bus, dpc + DPC_CONTEXT), rd(bus, dpc + DPC_ARG1), rd(bus, dpc + DPC_ARG2)];
+        self.dpcs_run += 1;
         self.inject_call(bus, regs, routine, &args, DISPATCH_LEVEL);
         true
+    }
+
+    pub fn dpcs_queued(&self) -> usize {
+        self.dpcs.len()
     }
 
     pub fn dpc_pending(&self) -> bool {

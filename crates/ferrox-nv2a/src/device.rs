@@ -47,6 +47,9 @@ pub struct Shared {
     unhandled: Mutex<BTreeMap<(bool, u32), u32>>,
     /// The latest register accesses (is_write, offset, value), for finding what a stuck game waits on.
     recent: Mutex<std::collections::VecDeque<(bool, u32, u32)>>,
+    /// The latest accesses to the interrupt registers of the chip's units, which `recent` loses
+    /// under a flood of other traffic.
+    irq_recent: Mutex<std::collections::VecDeque<(bool, u32, u32)>>,
     /// PGRAPH_SURFACE: the display-flip counters (write index bits 20-22, read index 24-26,
     /// modulus 28-30). The game's pushbuffer advances the write index; its vblank handler
     /// advances the read index.
@@ -144,12 +147,33 @@ impl Shared {
         }
         r.push_back((write, offset as u32, value));
         drop(r);
+        if matches!(offset, 0x100 | 0x140 | 0x2100 | 0x2140 | 0x400100 | 0x400140 | 0x600100 | 0x600140) {
+            let mut q = self.irq_recent.lock().unwrap();
+            if q.len() >= 64 {
+                q.pop_front();
+            }
+            q.push_back((write, offset as u32, value));
+        }
         *self.hot.lock().unwrap().entry((write, offset as u32)).or_insert(0) += 1;
     }
 
     /// The most recent register accesses, oldest first: (is_write, offset, value).
     pub fn recent_accesses(&self) -> Vec<(bool, u32, u32)> {
         self.recent.lock().unwrap().iter().copied().collect()
+    }
+
+    /// The latest accesses to the interrupt registers, oldest first.
+    pub fn interrupt_accesses(&self) -> Vec<(bool, u32, u32)> {
+        self.irq_recent.lock().unwrap().iter().copied().collect()
+    }
+
+    /// (PMC_INTR_EN_0, PCRTC_INTR_EN_0, PCRTC_INTR_0) as the host sees them.
+    pub fn interrupt_state(&self) -> (u32, u32, u32) {
+        (
+            self.pmc_intr_en.load(Ordering::Relaxed),
+            self.pcrtc_intr_en.load(Ordering::Relaxed),
+            self.pcrtc_intr.load(Ordering::Relaxed),
+        )
     }
 
     /// The `n` most-touched registers: (is_write, offset, count).
