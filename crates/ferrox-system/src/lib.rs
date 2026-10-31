@@ -848,7 +848,7 @@ mod tests {
     fn a_probe_survives_and_lists_missing_kernel_functions() {
         let dir = std::env::temp_dir().join(format!("ferrox-sys3-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let name = "ObReferenceObjectByHandle";
+        let name = "IoCreateDevice";
         assert!(!{
             let mut h = KernelHle::with_table();
             kernel::install(&mut h, HEAP);
